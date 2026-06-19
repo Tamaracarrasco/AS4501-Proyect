@@ -8,7 +8,7 @@ import tarfile, io
 import numpy as np
 import matplotlib.pyplot as plt
 
-ARCHIVE = "/mnt/d/thesis_files/files/galaxies_samples/COSMOS/images/cosmos_TC_202602.tar.gz.part_aa"
+ARCHIVE = "../data/cosmos_TC_202602.tar.gz.part_aa"
 BAND_LABELS = ["g", "r", "i", "z"]
 N_LEVELS = 5
 
@@ -68,4 +68,4 @@ def plot_galaxy(arr, name, band_labels=BAND_LABELS, n_levels=N_LEVELS, save_path
 
 arrays, names = load_n(ARCHIVE, 1)
 plot_galaxy(arrays[0], names[0],
-            save_path="/home/tamara/thesis-proyect/bricks_ddf_lsst/scripts/cosmos_cutouts.png")
+            save_path="../file_out_data/figures/cosmos_cutouts.png")
