@@ -1,0 +1,11 @@
+# Significado archivos
+
+1. features_images_20260618.csv: contiene features de la muestra de stamps.
+2. cosmos_TC_2020602.tar.gz.part_aa: son los stamps. tienen un id. 
+3. COSMOS_galaxies_20260618.txt: Contiene features de la muestra global de fuentes. De acá
+se sacaron las features de los stamps.
+----  todos los objetos tienen un redshift espectroscópico confiable.
+
+4: COSMOS_galaxies_20260617.csv: corresponde a objetos y sus propiedades fotométricas
+del tractor catalog. Son millones de objetos. acá no se ha hecho
+un cruce con catálogos de redshift espectroscópico.
