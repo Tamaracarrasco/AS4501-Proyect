@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 # Cambiar estos directorios.
 
 DDF = "COSMOS"
-IMAGES_PATH = f"/mnt/d/thesis_files/files/galaxies_samples/{DDF}/images/"
+IMAGES_PATH = f"../data/"
 IMAGES_FILE = f"cosmos_TC_202602.tar.gz.part_aa"
 
 def load_all(path):
@@ -28,5 +28,6 @@ def load_all(path):
 
 #%%
 arrays, names = load_all(IMAGES_PATH + IMAGES_FILE)
+print(names)
 
 # actualemte son 32mil imagenes pero las fetures solo tienen 29mil  registros nms
