@@ -16,7 +16,7 @@ Arquitectura tentativa:
     - Cada rama: Conv2d -> BatchNorm -> LeakyReLU, reduciendo 30->15->8->4.
     - Los 5 vectores de rama se concatenan y una MLP de fusión produce mu/logvar.
     - Decoder simétrico: z -> fusión inversa -> 5 vectores -> rama decoder
-      compartida (upsample+conv) -> reconstrucción (N,5,4,30,30).
+      compartida (PixelShuffle) -> reconstrucción (N,5,4,30,30).
 
 Decisiones de diseño no obvias (ver también comentarios inline):
     - Salida del decoder LINEAL (identidad): los datos están z-scoreados
@@ -30,8 +30,10 @@ Decisiones de diseño no obvias (ver también comentarios inline):
     - Selección de modelo (early stopping / checkpoint / scheduler) usa la loss
       de validación evaluada SIEMPRE con beta_final (objetivo estacionario),
       aunque el entрenamiento use la beta annealed -> métrica comparable entre épocas.
-    - upsample+conv en el decoder en vez de ConvTranspose para evitar artefactos
-      de checkerboard.
+    - PixelShuffle (sub-pixel conv) en el decoder en vez de upsample bilineal: el
+      bilineal es pasa-bajos y borronea (se verificó que NO lograba ni overfittear
+      64 stamps); PixelShuffle aprende el upsampling y evita el checkerboard de
+      ConvTranspose.
 
 Uso en Colab (extensión VSCode):
     !pip install umap-learn wandb        # umap requisito; wandb opcional
@@ -49,6 +51,9 @@ import json
 import math
 import os
 import random
+import re
+import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -91,12 +96,16 @@ CONFIG = {
     # sobrescribir con $VAE_DATA / $VAE_OUT o con los flags --data / --out-dir.
     "data_path": os.environ.get("VAE_DATA", str(_REPO / "file_out_data" / "vae_input.npz")),
     "out_dir":   os.environ.get("VAE_OUT", str(_REPO / "file_out_data")),
+    # id de corrida: sufijo de TODAS las salidas (vae_metrics{N}.csv, vae{N}.input,
+    # figures/vae{N}/, checkpoints/vae_best{N}.pt). None = auto-incrementa al siguiente
+    # entero libre mirando los vae_summary*.json existentes (no pisa corridas previas).
+    "run_id":    None,
 
     # arquitectura
     "z_dim":        64,        # dimensión latente (hiperparámetro)
     "branch_dim":   128,       # vector por rama (por nivel)
     "fusion_dim":   256,       # capa de fusión
-    "base_ch":      32,        # canales base del encoder (32,64,128)
+    "base_ch":      64,        # canales base de encoder/decoder (64,128,256)
     "share_level_weights": True,   # True = un encoder compartido para los 5 niveles
 
     # pérdida
@@ -115,8 +124,8 @@ CONFIG = {
     "seed":         42,
 
     # visualización / monitoreo
-    "recon_every":  10,        # grilla recon + samples del prior cada N épocas
-    "umap_every":   0,         # 0 = solo al final; >0 = cada K épocas
+    "fig_every":    50,        # guarda recon + prior + umap cada N épocas
+                               # (y SIEMPRE en la última/best época al terminar)
     "viz_level":    2,         # nivel a visualizar (2 = FOV 30")
     "viz_mode":     "rgb",     # "rgb" (g/r/i) o "band"
     "viz_band":     1,         # banda si viz_mode="band" (1 = r)
@@ -183,7 +192,9 @@ def load_data(config):
     d = np.load(config["data_path"], allow_pickle=True)
     X = d["X"]                                  # (N,5,4,30,30)
     tr, va = d["idx_train"], d["idx_val"]
+    te = d["idx_test"] if "idx_test" in d else np.array([], dtype=int)
     types = d["type"];  zred = d["z"]
+    bands = [str(b) for b in d["bands"]] if "bands" in d else BAND_NAMES
 
     train_ds = StampDataset(X[tr])
     val_ds = StampDataset(X[va])
@@ -202,7 +213,8 @@ def load_data(config):
         "X_val": torch.as_tensor(X[va], dtype=torch.float32),
         "type_val": np.asarray(types)[va],
         "z_val": np.asarray(zred)[va].astype(float),
-        "n_train": len(tr), "n_val": len(va),
+        "n_train": len(tr), "n_val": len(va), "n_test": len(te),
+        "x_shape": tuple(int(s) for s in X.shape), "bands": bands,
     }
 
 
@@ -233,30 +245,41 @@ class EncoderBranch(nn.Module):
 
 
 class DecoderBranch(nn.Module):
-    """Simétrico al encoder: vector branch_dim -> (4,30,30). 4->8->15->30."""
+    """Simétrico al encoder: vector branch_dim -> (4,30,30).
+
+    Usa PixelShuffle (sub-pixel conv) en vez de upsample bilineal. El bilineal es
+    un filtro pasa-bajos y no puede sintetizar alta frecuencia -> reconstrucciones
+    borrosas (verificado: el decoder bilineal NO lograba ni overfittear 64 stamps,
+    techo SSIM~0.45; con PixelShuffle el mismo test sube a SSIM~0.94). PixelShuffle
+    aprende el upsampling y evita el checkerboard de ConvTranspose.
+    Espacial: 4 -> 8 -> 16 -> 32 (tres x2) y crop final centrado a 30.
+    """
 
     def __init__(self, base_ch, branch_dim):
         super().__init__()
         c1, c2, c3 = base_ch, base_ch * 2, base_ch * 4
         self.c3 = c3
         self.fc = nn.Linear(branch_dim, c3 * 4 * 4)
-        # upsample (interpolación) + conv para evitar checkerboard
-        self.up1 = nn.Sequential(
-            nn.Conv2d(c3, c2, 3, padding=1), nn.BatchNorm2d(c2),
-            nn.LeakyReLU(0.2, inplace=True))
-        self.up2 = nn.Sequential(
-            nn.Conv2d(c2, c1, 3, padding=1), nn.BatchNorm2d(c1),
-            nn.LeakyReLU(0.2, inplace=True))
+
+        def ps_block(cin, cout):
+            # conv -> cout*4 canales; PixelShuffle(2) los reordena a cout y duplica
+            # el lado espacial; luego una conv de refinamiento.
+            return nn.Sequential(
+                nn.Conv2d(cin, cout * 4, 3, padding=1), nn.PixelShuffle(2),
+                nn.BatchNorm2d(cout), nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(cout, cout, 3, padding=1),
+                nn.BatchNorm2d(cout), nn.LeakyReLU(0.2, inplace=True))
+
+        self.b1 = ps_block(c3, c2)                        # 4  -> 8
+        self.b2 = ps_block(c2, c1)                        # 8  -> 16
+        self.b3 = ps_block(c1, c1)                        # 16 -> 32
         # última conv -> 4 bandas, SIN activación (salida lineal, datos z-scoreados)
         self.out = nn.Conv2d(c1, N_BANDS, 3, padding=1)
 
     def forward(self, v):
         h = F.leaky_relu(self.fc(v), 0.2).view(-1, self.c3, 4, 4)
-        h = F.interpolate(h, size=8, mode="bilinear", align_corners=False)
-        h = self.up1(h)
-        h = F.interpolate(h, size=15, mode="bilinear", align_corners=False)
-        h = self.up2(h)
-        h = F.interpolate(h, size=IMG, mode="bilinear", align_corners=False)
+        h = self.b3(self.b2(self.b1(h)))                  # (.,c1,32,32)
+        h = h[:, :, 1:31, 1:31]                           # crop 32 -> 30 (centrado)
         return self.out(h)                                # (.,4,30,30) lineal
 
 
@@ -524,14 +547,33 @@ def latent_umap(model, data, device, config, epoch, logger):
 # =========================================================================== #
 # 6. Logger  (local siempre; wandb opcional detrás de flag)
 # =========================================================================== #
+def resolve_run_id(config):
+    """run_id a usar. Si config['run_id'] es None, auto-incrementa al siguiente entero
+    libre mirando los vae_summary*.json del out_dir (así no pisa corridas previas)."""
+    if config["run_id"] is not None:
+        return int(config["run_id"])
+    used = []
+    for p in Path(config["out_dir"]).glob("vae_summary*.json"):
+        m = re.search(r"vae_summary(\d+)\.json$", p.name)
+        if m:
+            used.append(int(m.group(1)))
+    return max(used) + 1 if used else 1
+
+
 class Logger:
     def __init__(self, config):
         self.config = config
-        self.fig_dir = Path(config["out_dir"]) / "figures" / "vae"
-        self.ckpt_dir = Path(config["out_dir"]) / "checkpoints"
+        rid = config["run_id"]
+        out = Path(config["out_dir"])
+        self.run_id = rid
+        self.fig_dir = out / "figures" / f"vae{rid}"      # figuras por-corrida
+        self.ckpt_dir = out / "checkpoints"
         self.fig_dir.mkdir(parents=True, exist_ok=True)
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
-        self.metrics_path = Path(config["out_dir"]) / "vae_metrics.csv"
+        self.metrics_path = out / f"vae_metrics{rid}.csv"
+        self.summary_path = out / f"vae_summary{rid}.json"
+        self.input_path = out / f"vae{rid}.input"
+        self.ckpt_path = self.ckpt_dir / f"vae_best{rid}.pt"
         self.history = []
         self.use_wandb = config["use_wandb"] and HAS_WANDB
         if config["use_wandb"] and not HAS_WANDB:
@@ -539,6 +581,74 @@ class Logger:
         if self.use_wandb:
             wandb.init(project=config["wandb_project"], name=config["wandb_run"],
                        config=config)
+
+    def write_input(self, config, data, model, device):
+        """Escribe vae{N}.input: registro de reproducibilidad en texto plano legible
+        (z, hiperparámetros, beta, entorno y un esquema corto de la arquitectura).
+        Se llama al INICIO del run para que exista aunque la corrida falle luego."""
+        n_par = sum(p.numel() for p in model.parameters())
+        c1, c2, c3 = config["base_ch"], config["base_ch"] * 2, config["base_ch"] * 4
+        bd, fd, zd = config["branch_dim"], config["fusion_dim"], config["z_dim"]
+        shared = "compartida" if config["share_level_weights"] else "independiente"
+        try:
+            commit = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"], cwd=str(_REPO),
+                capture_output=True, text=True, timeout=5).stdout.strip() or "n/a"
+        except Exception:
+            commit = "n/a"
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        arch = (
+            f"[arquitectura]  multi-res VAE Siames (encoder {shared} entre los {N_LEVELS} niveles)\n"
+            f"  in ({N_LEVELS}x{N_BANDS}x{IMG}x{IMG})\n"
+            f"   |- EncoderBranch x{N_LEVELS} [{shared}]: Conv {IMG}->15->8->4, ch {c1}->{c2}->{c3}, fc -> {bd}\n"
+            f"        |- concat({N_LEVELS}x{bd}={N_LEVELS*bd}) -> fuse({fd}) -> mu/logvar  => z({zd})\n"
+            f"  z({zd}) -> dec_fuse({fd}) -> {N_LEVELS}x{bd}\n"
+            f"   |- DecoderBranch x{N_LEVELS} [{shared}]: fc->4x4({c3}), PixelShuffle 4->8->16->32,\n"
+            f"        crop->{IMG}, conv -> {N_BANDS} bandas  (salida lineal, z-score)\n"
+            f"  out ({N_LEVELS}x{N_BANDS}x{IMG}x{IMG})"
+        )
+
+        txt = f"""# vae{self.run_id}.input — registro de reproducibilidad
+# generado: {ts}   |   run_id: {self.run_id}
+
+[datos]
+data_path     : {config['data_path']}
+X_shape       : {data['x_shape']}    # (N, niveles, bandas, H, W)
+bands         : {', '.join(data['bands'])}
+norm          : arcsinh(flux/sigma_bg) + zscore por canal (fit solo en train)
+split         : train/val/test = {data['n_train']}/{data['n_val']}/{data['n_test']}  (estratif. por tipo, seed {config['seed']})
+
+[latente]
+z_dim         : {zd}
+
+[hiperparametros]
+seed          : {config['seed']}
+base_ch       : {config['base_ch']}
+branch_dim    : {bd}
+fusion_dim    : {fd}
+share_levels  : {config['share_level_weights']}
+lr            : {config['lr']}
+batch_size    : {config['batch_size']}
+epochs        : {config['epochs']}   (early stopping patience={config['patience']})
+grad_clip     : {config['grad_clip']}
+
+[perdida]
+recon         : MSE gaussiana (suma por imagen)
+beta_inicial  : 0.0
+beta_final    : {config['beta_final']}
+warmup_epochs : {config['warmup_epochs']}        # beta sube 0.0 -> {config['beta_final']} lineal en {config['warmup_epochs']} epocas
+
+[entorno]
+device        : {device.type}
+torch         : {torch.__version__}
+n_params      : {n_par/1e6:.2f}M
+git_commit    : {commit}
+
+{arch}
+"""
+        self.input_path.write_text(txt)
+        print(f"[logger] escrito {self.input_path}")
 
     def log_scalars(self, epoch, d):
         row = {"epoch": epoch, **d}
@@ -595,10 +705,14 @@ def main(config=CONFIG, epoch_callback=None):
     opt = torch.optim.Adam(model.parameters(), lr=config["lr"])
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode="min", factor=0.5, patience=config["sched_patience"])
+
+    config["run_id"] = resolve_run_id(config)        # sufijo de todas las salidas
+    print(f"run_id: {config['run_id']}")
     logger = Logger(config)
+    logger.write_input(config, data, model, device)  # registro de reproducibilidad
 
     best_val = math.inf; best_epoch = -1; bad = 0
-    ckpt = logger.ckpt_dir / "vae_best.pt"
+    ckpt = logger.ckpt_path
 
     for epoch in range(1, config["epochs"] + 1):
         beta = beta_schedule(epoch, config)
@@ -626,11 +740,10 @@ def main(config=CONFIG, epoch_callback=None):
               f"act={val['active_dims']}/{config['z_dim']} "
               f"ssim={val.get('ssim', float('nan')):.3f}")
 
-        # visualizaciones periódicas
-        if epoch % config["recon_every"] == 0:
+        # visualizaciones periódicas: recon + prior + umap cada fig_every épocas
+        if epoch % config["fig_every"] == 0:
             save_recon_grid(model, data["X_val"], device, config, epoch, logger)
             save_prior_samples(model, device, config, epoch, logger)
-        if config["umap_every"] and epoch % config["umap_every"] == 0:
             latent_umap(model, data, device, config, epoch, logger)
 
         # hook de monitoreo en vivo (notebook). Va después de guardar las figuras
@@ -649,20 +762,28 @@ def main(config=CONFIG, epoch_callback=None):
                 print(f"early stopping en época {epoch} (mejor={best_epoch})")
                 break
 
-    # restaura el mejor modelo y hace UMAP final
+    # restaura el mejor modelo y guarda las figuras de la última (best) época
     print(f"mejor val={best_val:.2f} (época {best_epoch}); cargando checkpoint")
     model.load_state_dict(torch.load(ckpt, map_location=device)["model"])
-    latent_umap(model, data, device, config, best_epoch, logger)
     save_recon_grid(model, data["X_val"], device, config, best_epoch, logger)
+    save_prior_samples(model, device, config, best_epoch, logger)
+    latent_umap(model, data, device, config, best_epoch, logger)
 
     # resumen final
     final = validate(model, data["val_loader"], device, config)
-    summary = {"best_epoch": best_epoch, "best_val_total": best_val,
+    summary = {"run_id": config["run_id"],
+               "best_epoch": best_epoch, "best_val_total": best_val,
                "final_recon_val": final["recon"], "final_kl_val": final["kl"],
                "final_mse_px": final["mse_px"], "final_active_dims": final["active_dims"],
                "final_ssim": final.get("ssim"), "final_psnr": final.get("psnr"),
-               "z_dim": config["z_dim"]}
-    (Path(config["out_dir"]) / "vae_summary.json").write_text(json.dumps(summary, indent=2))
+               "z_dim": config["z_dim"],
+               "out_files": {
+                   "metrics":    logger.metrics_path.name,
+                   "input":      logger.input_path.name,
+                   "figures":    f"figures/vae{config['run_id']}/",
+                   "checkpoint": f"checkpoints/{logger.ckpt_path.name}",
+               }}
+    logger.summary_path.write_text(json.dumps(summary, indent=2))
     print("resumen:", json.dumps(summary, indent=2))
     logger.finish()
     return model
@@ -678,6 +799,8 @@ if __name__ == "__main__":
     ap.add_argument("--batch-size", type=int)
     ap.add_argument("--lr", type=float)
     ap.add_argument("--seed", type=int)
+    ap.add_argument("--run-id", type=int,
+                    help="id de corrida (sufijo de salidas); omitir = auto-incrementa")
     ap.add_argument("--wandb", action="store_true", help="activa logging a Weights & Biases")
     ap.add_argument("--no-share", action="store_true",
                     help="pesos independientes por nivel (en vez de compartidos)")
@@ -692,6 +815,7 @@ if __name__ == "__main__":
     if args.batch_size:  cfg["batch_size"] = args.batch_size
     if args.lr:          cfg["lr"] = args.lr
     if args.seed is not None: cfg["seed"] = args.seed
+    if args.run_id is not None: cfg["run_id"] = args.run_id
     if args.wandb:       cfg["use_wandb"] = True
     if args.no_share:    cfg["share_level_weights"] = False
     main(cfg)
