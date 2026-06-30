@@ -61,7 +61,6 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
 
 # --- imports opcionales (Colab los tiene tras pip install; local pueden faltar) ---
 try:
@@ -112,6 +111,8 @@ CONFIG = {
     "beta_final":   1.0,       # peso final de la KL
     "warmup_epochs": 30,       # épocas de warm-up lineal de beta (0 -> beta_final)
     "active_kl_thresh": 0.01,  # umbral KL/dim para contar dims "activas"
+    "metrics_every": 10,       # cada cuántas épocas se calculan SSIM/PSNR (caras);
+                               # la val-loss (early stopping) se calcula SIEMPRE
 
     # entrenamiento
     "lr":           1e-3,
@@ -161,33 +162,45 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def seed_worker(worker_id):
-    """Semilla por worker del DataLoader (cada uno deriva de la semilla global)."""
-    s = torch.initial_seed() % 2**32
-    np.random.seed(s)
-    random.seed(s)
-
-
 # =========================================================================== #
-# 1. Dataset / dataloader
+# 1. Datos: mini-batches residentes en GPU
 # =========================================================================== #
-class StampDataset(Dataset):
-    """Envuelve un tensor (N,5,4,30,30) ya normalizado. Devuelve (x, idx)."""
+class GPUBatches:
+    """Itera mini-batches de un tensor que YA vive en la GPU.
 
-    def __init__(self, X):
-        self.X = torch.as_tensor(X, dtype=torch.float32)
+    Sin DataLoader, sin workers y sin copiar host->device por batch: el dataset
+    (30x30 px) cabe holgado en la memoria unificada del M5 Pro, así que lo subimos
+    entero a MPS una sola vez y todo el batcheo ocurre en la GPU. Eso mantiene la
+    GPU alimentada (mejor utilización) y elimina el cuello de botella de transferencia.
+    """
+
+    def __init__(self, X, batch_size, device, shuffle, seed=42, drop_last=False):
+        self.X = X.to(device)                  # 1 sola transferencia -> queda en GPU
+        self.bs = batch_size
+        self.shuffle = shuffle
+        self.device = device
+        self.drop_last = drop_last
+        self.g = torch.Generator().manual_seed(seed)   # barajado reproducible
 
     def __len__(self):
-        return self.X.shape[0]
+        n = self.X.shape[0]
+        return n // self.bs if self.drop_last else (n + self.bs - 1) // self.bs
 
-    def __getitem__(self, i):
-        return self.X[i], i
+    def __iter__(self):
+        n = self.X.shape[0]
+        # permutación (train) u orden fijo (val), generada en CPU (barato) y subida a GPU
+        idx = torch.randperm(n, generator=self.g) if self.shuffle else torch.arange(n)
+        idx = idx.to(self.device)
+        last = n - (n % self.bs) if self.drop_last else n
+        for i in range(0, last, self.bs):
+            sel = idx[i:i + self.bs]
+            yield self.X[sel], sel             # gather en GPU: el batch no toca la CPU
 
 
-def load_data(config):
-    """Carga el .npz y arma loaders de train/val + arrays de val para UMAP.
+def load_data(config, device):
+    """Carga el .npz, sube train/val a la GPU y arma los batchers (GPUBatches).
 
-    Devuelve dict con loaders, tensores de val, y etiquetas (type, z) de val.
+    Devuelve dict con loaders, tensor de val en GPU y etiquetas (type, z) de val.
     """
     d = np.load(config["data_path"], allow_pickle=True)
     X = d["X"]                                  # (N,5,4,30,30)
@@ -196,21 +209,18 @@ def load_data(config):
     types = d["type"];  zred = d["z"]
     bands = [str(b) for b in d["bands"]] if "bands" in d else BAND_NAMES
 
-    train_ds = StampDataset(X[tr])
-    val_ds = StampDataset(X[va])
+    # Subimos train y val a la GPU UNA vez (memoria unificada del M5 Pro lo permite).
+    Xtr = torch.as_tensor(X[tr], dtype=torch.float32).to(device)
+    Xva = torch.as_tensor(X[va], dtype=torch.float32).to(device)
 
-    g = torch.Generator().manual_seed(config["seed"])
-    train_loader = DataLoader(train_ds, batch_size=config["batch_size"],
-                              shuffle=True, num_workers=config["num_workers"],
-                              generator=g, worker_init_fn=seed_worker, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=config["batch_size"],
-                            shuffle=False, num_workers=config["num_workers"],
-                            worker_init_fn=seed_worker)
+    train_loader = GPUBatches(Xtr, config["batch_size"], device,
+                              shuffle=True, seed=config["seed"], drop_last=True)
+    val_loader = GPUBatches(Xva, config["batch_size"], device, shuffle=False)
 
     return {
         "train_loader": train_loader,
         "val_loader": val_loader,
-        "X_val": torch.as_tensor(X[va], dtype=torch.float32),
+        "X_val": Xva,                           # mismo tensor en GPU (no se duplica)
         "type_val": np.asarray(types)[va],
         "z_val": np.asarray(zred)[va].astype(float),
         "n_train": len(tr), "n_val": len(va), "n_test": len(te),
@@ -411,8 +421,12 @@ def train_epoch(model, loader, opt, beta, device, grad_clip):
 
 
 @torch.no_grad()
-def validate(model, loader, device, config):
-    """Valida con beta_final (objetivo estacionario) y calcula diagnósticos."""
+def validate(model, loader, device, config, image_metrics=True):
+    """Valida con beta_final (objetivo estacionario) y calcula diagnósticos.
+
+    image_metrics=False omite SSIM/PSNR (lo caro); el resto (val-loss, mse_px,
+    active_dims) se calcula SIEMPRE -> el early stopping no se ve afectado.
+    """
     model.eval()
     beta_f = config["beta_final"]
     tot = rec = kl = mse_px = 0.0
@@ -428,8 +442,8 @@ def validate(model, loader, device, config):
         mse_px += F.mse_loss(recon, x, reduction="mean").item() * bs
         kld_accum += kl_per_dim(mu, logvar) * bs
         n += bs
-        # SSIM/PSNR sobre (B*5,4,30,30); data_range del propio batch
-        if HAS_TM:
+        # SSIM/PSNR sobre (B*5,4,30,30); data_range del propio batch (solo si se piden)
+        if HAS_TM and image_metrics:
             xr = x.reshape(-1, N_BANDS, IMG, IMG)
             rr = recon.reshape(-1, N_BANDS, IMG, IMG)
             dr = float(xr.max() - xr.min())
@@ -444,8 +458,8 @@ def validate(model, loader, device, config):
     out = {"total": tot / n, "recon": rec / n, "kl": kl / n,
            "mse_px": mse_px / n, "kl_per_dim_mean": float(kld.mean()),
            "active_dims": active, "kld_vec": kld}
-    if HAS_TM:
-        out["ssim"] = ssim_sum / n
+    if HAS_TM and image_metrics:               # sin métricas de imagen: claves ausentes
+        out["ssim"] = ssim_sum / n             # -> el log usa nan en esas épocas
         out["psnr"] = psnr_sum / n
     return out
 
@@ -695,7 +709,7 @@ def main(config=CONFIG, epoch_callback=None):
     if device.type == "cpu":
         print("[aviso] sin GPU (CUDA/MPS) -> corriendo en CPU (lento).")
 
-    data = load_data(config)
+    data = load_data(config, device)
     print(f"train={data['n_train']}  val={data['n_val']}")
 
     model = MultiResVAE(config).to(device)
@@ -718,7 +732,9 @@ def main(config=CONFIG, epoch_callback=None):
         beta = beta_schedule(epoch, config)
         tr = train_epoch(model, data["train_loader"], opt, beta, device,
                          config["grad_clip"])
-        val = validate(model, data["val_loader"], device, config)
+        # SSIM/PSNR (caras) solo cada metrics_every; la val-loss se calcula siempre
+        heavy = (epoch % config["metrics_every"] == 0)
+        val = validate(model, data["val_loader"], device, config, image_metrics=heavy)
         sched.step(val["total"])
         lr_now = opt.param_groups[0]["lr"]
 
@@ -744,7 +760,7 @@ def main(config=CONFIG, epoch_callback=None):
         if epoch % config["fig_every"] == 0:
             save_recon_grid(model, data["X_val"], device, config, epoch, logger)
             save_prior_samples(model, device, config, epoch, logger)
-            latent_umap(model, data, device, config, epoch, logger)
+            # UMAP solo en la mejor época (al cierre); es lo más caro de la viz.
 
         # hook de monitoreo en vivo (notebook). Va después de guardar las figuras
         # para que el callback pueda mostrar las PNG recién generadas.
@@ -789,6 +805,111 @@ def main(config=CONFIG, epoch_callback=None):
     return model
 
 
+# =========================================================================== #
+# 8. Barrido (sweep): N VAEs definidos por parameters_vae.dat
+# =========================================================================== #
+# El .dat es texto plano: la 1ª línea (que empieza con '#') son los NOMBRES de
+# columna = parámetros a variar; cada línea siguiente es UNA corrida. Los nombres
+# aceptan alias legibles (beta -> beta_final, share_levels -> share_level_weights,
+# batchsize -> batch_size, ...) que se mapean a claves de CONFIG.
+_SWEEP_ALIASES = {
+    "z_dim": "z_dim", "zdim": "z_dim",
+    "beta": "beta_final", "beta_final": "beta_final",
+    "warmup_epochs": "warmup_epochs", "warmup": "warmup_epochs",
+    "batch_size": "batch_size", "batchsize": "batch_size", "batch": "batch_size",
+    "base_ch": "base_ch",
+    "branch_dim": "branch_dim", "fusion_dim": "fusion_dim",
+    "lr": "lr", "epochs": "epochs", "seed": "seed",
+    "share_levels": "share_level_weights", "share": "share_level_weights",
+    "share_level_weights": "share_level_weights",
+    "grad_clip": "grad_clip", "patience": "patience", "warmup_ep": "warmup_epochs",
+    "run_id": "run_id",
+}
+_SWEEP_INT = {"z_dim", "warmup_epochs", "batch_size", "base_ch", "branch_dim",
+              "fusion_dim", "epochs", "seed", "patience", "run_id"}
+_SWEEP_FLOAT = {"beta_final", "lr", "grad_clip"}
+_SWEEP_BOOL = {"share_level_weights"}
+
+
+def _coerce_param(key, val):
+    """Convierte el token de texto al tipo correcto según la clave de CONFIG."""
+    if key in _SWEEP_BOOL:
+        return str(val).lower() in ("1", "true", "yes", "y", "t")
+    if key in _SWEEP_INT:
+        return int(float(val))          # tolera '30' y '30.0'
+    if key in _SWEEP_FLOAT:
+        return float(val)               # tolera '1e-3'
+    return val
+
+
+def parse_sweep_file(path):
+    """Lee parameters_vae.dat -> lista de dicts de overrides (uno por corrida).
+
+    1ª línea con '#' = header (nombres de columna/parámetros). Líneas siguientes =
+    una corrida cada una, con tantos valores como columnas. Líneas vacías y '#'
+    extra se ignoran (se pueden comentar filas).
+    """
+    header, rows = None, []
+    for ln in Path(path).read_text().splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            if header is None:
+                header = s.lstrip("#").split()
+            continue
+        rows.append(s.split())
+    if header is None:
+        raise ValueError(f"{path}: falta el header '# z_dim beta ...' en la 1ª línea.")
+
+    keys = []
+    for h in header:
+        k = _SWEEP_ALIASES.get(h.lower())
+        if k is None:
+            raise ValueError(
+                f"{path}: columna '{h}' no reconocida. "
+                f"Válidas: {sorted(set(_SWEEP_ALIASES))}")
+        keys.append(k)
+
+    configs = []
+    for i, vals in enumerate(rows, 1):
+        if len(vals) != len(keys):
+            raise ValueError(
+                f"{path}: fila {i} tiene {len(vals)} valores pero el header "
+                f"define {len(keys)} columnas.")
+        configs.append({k: _coerce_param(k, v) for k, v in zip(keys, vals)})
+    return configs
+
+
+def run_sweep(path, base_config):
+    """Corre un VAE por cada fila de `path`.
+
+    Cada corrida parte de `base_config`, le aplica los overrides de su fila y usa
+    run_id auto-incremental (no pisa corridas previas): genera vae{N}.input,
+    vae_metrics{N}.csv, vae_summary{N}.json, figures/vae{N}/, checkpoints/vae_best{N}.pt.
+    Si una corrida falla, se reporta y el barrido continúa con la siguiente.
+    """
+    overrides = parse_sweep_file(path)
+    print(f"[sweep] {len(overrides)} configuraciones desde {path}")
+    ok, fail = 0, 0
+    for i, ov in enumerate(overrides, 1):
+        cfg = dict(base_config)
+        cfg.update(ov)
+        cfg["run_id"] = ov.get("run_id")        # None -> auto-incrementa por corrida
+        print("\n" + "=" * 72)
+        print(f"[sweep] corrida {i}/{len(overrides)}  overrides={ov}")
+        print("=" * 72)
+        try:
+            main(cfg)
+            ok += 1
+        except Exception as e:                  # una config rota no tumba el barrido
+            import traceback
+            fail += 1
+            print(f"[sweep] corrida {i} FALLÓ: {e}")
+            traceback.print_exc()
+    print(f"\n[sweep] barrido completo: {ok} ok, {fail} con error.")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="VAE multi-resolución COSMOS")
     ap.add_argument("--data", help="ruta al vae_input.npz (default: $VAE_DATA o file_out_data/)")
@@ -804,6 +925,9 @@ if __name__ == "__main__":
     ap.add_argument("--wandb", action="store_true", help="activa logging a Weights & Biases")
     ap.add_argument("--no-share", action="store_true",
                     help="pesos independientes por nivel (en vez de compartidos)")
+    ap.add_argument("--sweep", nargs="?", const=str(_REPO / "scripts" / "parameters_vae.dat"),
+                    help="corre N VAEs, uno por fila de parameters_vae.dat "
+                         "(sin valor usa scripts/parameters_vae.dat)")
     args = ap.parse_args()
 
     cfg = dict(CONFIG)
@@ -818,4 +942,8 @@ if __name__ == "__main__":
     if args.run_id is not None: cfg["run_id"] = args.run_id
     if args.wandb:       cfg["use_wandb"] = True
     if args.no_share:    cfg["share_level_weights"] = False
-    main(cfg)
+
+    if args.sweep:                       # barrido: N corridas desde el .dat
+        run_sweep(args.sweep, cfg)
+    else:                                # corrida única (comportamiento previo)
+        main(cfg)
