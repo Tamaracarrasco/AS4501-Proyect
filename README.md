@@ -42,6 +42,64 @@ La data debe descargarse desde la nube de Drive y dejarse de manera local. Los a
 
 ---
 
+## Pipeline del VAE (reproducible, desde terminal o VSCode)
+
+Corre 100% local (terminal o el botón *Run* de VSCode con el intérprete `hips-env`
+seleccionado). No requiere Google Colab. Usa GPU automáticamente si hay CUDA
+disponible; si no, cae a CPU (lento) con un aviso.
+
+### 0. GPU (opcional pero recomendado)
+
+`requirements.txt` fija `torch==2.12.0+cpu`. Para usar GPU, instala la build CUDA
+que corresponda a tu driver **después** de instalar los requirements, por ejemplo:
+
+```bash
+pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu121
+```
+
+Verifica con: `python -c "import torch; print(torch.cuda.is_available())"`.
+
+### 1. Datos
+
+Deja en `/data/` el tar de stamps (`cosmos_TC_202602.tar.gz.part_aa`) y
+`features_images_20260618.csv`. Si los tienes en otra carpeta, puedes apuntarlos
+sin tocar el código:
+
+```bash
+export COSMOS_TAR="/ruta/a/cosmos_TC_202602.tar.gz.part_aa"
+```
+
+### 2. Preprocesamiento → `file_out_data/vae_input.npz`
+
+Aplica los filtros (maskbits, flujo>0, profundidad, SNR, NaN), normaliza
+(arcsinh + z-score por canal) y genera el tensor `(N, 5, 4, 30, 30)` con el split
+train/val/test **estratificado por tipo** (semilla fija → reproducible):
+
+```bash
+python scripts/preprocess_vae.py
+```
+
+### 3. Entrenamiento del VAE
+
+```bash
+python scripts/VAE.py                 # config por defecto (z_dim=64, 200 épocas)
+python scripts/VAE.py --epochs 100 --z-dim 32 --beta-final 0.5   # overrides
+python scripts/VAE.py --wandb         # opcional: dashboard en vivo
+```
+
+### Salidas (en `file_out_data/`, commiteables para que el equipo las vea)
+
+| Archivo | Contenido |
+|---|---|
+| `vae_metrics.csv` | una fila por época: recon, KL, beta, lr, dims activas, SSIM/PSNR,etc |
+| `figures/vae/recon_*.png` | input vs reconstrucción |
+| `figures/vae/prior_*.png` | samples del prior z~N(0,I) |
+| `figures/vae/umap_*.png` | espacio latente (mu) coloreado por tipo y redshift |
+| `vae_summary.json` | métricas finales |
+| `checkpoints/vae_best.pt` | mejor modelo (menor loss de validación) |
+
+---
+
 ## Agregar una nueva librería
 
 Cuando se necesite instalar una nueva librería al proyecto, seguir estos pasos:
