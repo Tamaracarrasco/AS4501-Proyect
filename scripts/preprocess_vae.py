@@ -12,13 +12,14 @@ Decisiones acordadas para el VAE:
     Las estadísticas se estiman SOLO sobre el split de entrenamiento (sin fuga).
 
 Pipeline:
-  1. load_features  -> filtros de catálogo sobre el CSV de features.
-  2. load_stamps    -> lee el tar, detecta NaN.
-  3. align          -> intersección por desi_id y descarte de NaN.
-  4. split_ids      -> train/val/test.
-  5. fit_norm       -> softening (arcsinh) y mu/std por canal, en train.
-  6. apply_norm     -> arcsinh + z-score.
-  7. main           -> guarda .npz listo para el VAE.
+  1. load_features       -> filtros de catálogo sobre el CSV de features.
+  2. load_stamps         -> lee el tar, detecta NaN.
+  3. align               -> intersección por desi_id y descarte de NaN.
+  4. correct_extinction  -> divide cada banda por su mw_transmission (todos los niveles).
+  5. split_ids           -> train/val/test.
+  6. fit_norm            -> softening (arcsinh) y mu/std por canal, en train.
+  7. apply_norm          -> arcsinh + z-score.
+  8. main                -> guarda .npz listo para el VAE.
 
 Uso:
     # prueba rápida (carga solo N stamps):
@@ -51,7 +52,7 @@ _REPO = Path(__file__).resolve().parent.parent
 # sin tocar el código (p.ej. si tienes el tar en otra carpeta):
 #   export COSMOS_TAR="/ruta/a/cosmos_TC_202602.tar.gz.part_aa"
 TAR_PATH = Path(os.environ.get("COSMOS_TAR", _REPO / "data" / "cosmos_TC_202602.tar.gz.part_aa"))
-FEATURES_CSV = Path(os.environ.get("COSMOS_FEATURES", _REPO / "data" / "features_images_20260618.csv"))
+FEATURES_CSV = Path(os.environ.get("COSMOS_FEATURES", _REPO / "data" / "features_images_2026070.csv"))
 OUT_DIR = _REPO / "file_out_data"
 
 BANDS = ["g", "r", "i", "z"]            # orden del eje 0 del stamp
@@ -176,9 +177,28 @@ def align(df, stamps):
     df_al = df.set_index("desi_id").loc[ids].reset_index()
     return ids, X, df_al
 
+# --------------------------------------------------------------------------- #
+# 4. CORRECCIÓN EXTINCIÓN GALÁCTICA
+# --------------------------------------------------------------------------- #
+def correct_extinction(X, df):
+    """Corrige los stamps por extinción galáctica.
+
+    Para cada objeto y banda, divide los píxeles por su cociente de
+    transmisión mw_transmission_{banda} (misma corrección para los 5
+    niveles de resolución de esa banda).
+
+    X  : array (N, nivel, banda, 30, 30), salida de align().
+    df : DataFrame alineado con `df_al` (mismo orden e índice que X),
+         con columnas mw_transmission_{banda} para cada banda en BANDS.
+    """
+    transmission = np.stack(
+        [df[f"mw_transmission_{b}"].to_numpy() for b in BANDS], axis=1
+    )  # (N, 4)
+    return X / transmission[:, None, :, None, None]
+
 
 # --------------------------------------------------------------------------- #
-# 4. Split
+# 5. Split
 # --------------------------------------------------------------------------- #
 def split_ids(n, stratify=None, fracs=SPLIT_FRACS, seed=RANDOM_SEED):
     """Índices para train/val/test usando sklearn.
@@ -207,7 +227,7 @@ def split_ids(n, stratify=None, fracs=SPLIT_FRACS, seed=RANDOM_SEED):
 
 
 # --------------------------------------------------------------------------- #
-# 5. Normalización: arcsinh + z-score por canal (canal = nivel x banda)
+# 6. Normalización: arcsinh + z-score por canal (canal = nivel x banda)
 # --------------------------------------------------------------------------- #
 def fit_norm(X_train, max_stamps=2000, seed=RANDOM_SEED):
     """Estima, por canal (nivel, banda), el softening del arcsinh y mu/std.
@@ -277,6 +297,9 @@ def main(n_max=None, out_name="vae_input.npz", tar_path=None, features_path=None
 
     ids, X, df_al = align(df, stamps)
     print(f"\nMuestra final alineada: N={len(ids)}, X.shape={X.shape}")
+
+    X = correct_extinction(X, df_al)
+    print("Stamps corregidos por extinción galáctica (mw_transmission por banda).")
 
     tr, va, te = split_ids(len(ids), stratify=df_al["type"].to_numpy())
     print(f"Split  train/val/test: {len(tr)}/{len(va)}/{len(te)} "
