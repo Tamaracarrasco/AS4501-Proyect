@@ -52,7 +52,7 @@ _REPO = Path(__file__).resolve().parent.parent
 # sin tocar el código (p.ej. si tienes el tar en otra carpeta):
 #   export COSMOS_TAR="/ruta/a/cosmos_TC_202602.tar.gz.part_aa"
 TAR_PATH = Path(os.environ.get("COSMOS_TAR", _REPO / "data" / "cosmos_TC_202602.tar.gz.part_aa"))
-FEATURES_CSV = Path(os.environ.get("COSMOS_FEATURES", _REPO / "data" / "features_images_2026070.csv"))
+FEATURES_CSV = Path(os.environ.get("COSMOS_FEATURES", _REPO / "data" / "features_images_20260707.csv"))
 OUT_DIR = _REPO / "file_out_data"
 
 BANDS = ["g", "r", "i", "z"]            # orden del eje 0 del stamp
