@@ -4,7 +4,7 @@ VAE convolucional multi-resolución para stamps
 Input (producido por preprocess_vae.py):  X de shape (N, 5, 4, 30, 30)
     eje 1 -> 5 niveles de resolución (ramas)
     eje 2 -> 4 bandas g,r,i,z (canales de cada rama)
-    datos ya normalizados: arcsinh(flux/sigma_bg) + z-score por canal.
+    datos ya normalizados ("otro"): x/1000 -> sign(x)*(sqrt(sign(x)*x + 1) - 1).
 
 Arquitectura tentativa:
     - 5 ramas, una por nivel de resolución. CADA RAMA COMPARTE LOS PESOS
@@ -19,9 +19,9 @@ Arquitectura tentativa:
       compartida (PixelShuffle) -> reconstrucción (N,5,4,30,30).
 
 Decisiones de diseño no obvias (ver también comentarios inline):
-    - Salida del decoder LINEAL (identidad): los datos están z-scoreados
-      (no acotados, ~gaussianos) -> verosimilitud gaussiana -> pérdida MSE.
-      (Si fueran [0,1] se usaría sigmoide + BCE.)
+    - Salida del decoder LINEAL (identidad): la normalización "otro" deja los
+      datos con signo y sin acotar a un rango fijo (no en [0,1]) -> verosimilitud
+      gaussiana -> pérdida MSE. (Si fueran [0,1] se usaría sigmoide + BCE.)
     - Recon = SUMA por imagen (no media) para que su escala sea comparable a la
       KL (que también es suma sobre dims latentes). Si se promediara por píxel,
       la KL aplastaría todo y habría posterior collapse.
@@ -35,11 +35,22 @@ Decisiones de diseño no obvias (ver también comentarios inline):
       64 stamps); PixelShuffle aprende el upsampling y evita el checkerboard de
       ConvTranspose.
 
-Uso en Colab (extensión VSCode):
-    !pip install umap-learn wandb        # umap requisito; wandb opcional
-    from google.colab import drive; drive.mount('/content/drive')
-    # editar CONFIG["data_path"] y CONFIG["out_dir"] a rutas de Drive/content
-    # luego ejecutar este archivo (o llamar main(CONFIG)).
+Uso en Colab Pro desde la extensión "Colab" de VSCode (GPU remota, sin salir
+del editor; guía completa paso a paso en el README, sección "Alternativa:
+entrenar el VAE en Colab Pro desde VSCode"):
+    # 1. Extensions de VSCode -> instalar "Colab" (publisher Google) -> iniciar
+    #    sesión con la cuenta que tiene Colab Pro.
+    # 2. Abrir un .ipynb en VSCode y elegir el runtime "Colab" en el selector
+    #    de kernel (no un intérprete local); Runtime > Change runtime type
+    #    para elegir GPU.
+    # 3. En la primera celda, traer el repo y los datos:
+    !git clone https://github.com/Tamaracarrasco/AS4501-Proyect.git
+    %cd AS4501-Proyect
+    !pip install -r requirements.txt
+    from google.colab import drive; drive.mount('/content/drive')  # si los datos están en Drive
+    # 4. Entrenar como celda de shell (--data/--out-dir a rutas de Drive/content
+    #    para que los checkpoints y figuras sobrevivan a que el runtime se recicle):
+    !python scripts/VAE.py --out-dir /content/drive/MyDrive/AS4501-Proyect/file_out_data
 
 Local (CPU, env astro), prueba rápida:
     /opt/miniconda3/envs/astro/bin/python scripts/VAE.py
@@ -630,7 +641,7 @@ class Logger:
 data_path     : {config['data_path']}
 X_shape       : {data['x_shape']}    # (N, niveles, bandas, H, W)
 bands         : {', '.join(data['bands'])}
-norm          : arcsinh(flux/sigma_bg) + zscore por canal (fit solo en train)
+norm          : x/1000 -> sign(x)*(sqrt(sign(x)*x + 1) - 1)  ("otro", formula fija)
 split         : train/val/test = {data['n_train']}/{data['n_val']}/{data['n_test']}  (estratif. por tipo, seed {config['seed']})
 
 [latente]

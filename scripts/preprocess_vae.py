@@ -6,10 +6,12 @@ Decisiones acordadas para el VAE:
   - Filtrado ESTRICTO de la muestra: maskbits==0, flujo>0, cortes de
     profundidad (magnitud corregida por extinción) y SNR>=3 en todas las bandas,
     más eliminación de stamps con píxeles NaN.
-  - Normalización de intensidad: arcsinh + z-score POR CANAL (canal = banda x nivel).
-    El arcsinh comprime el rango dinámico (preserva el fondo ~0); el z-score
-    deja los 20 canales (4 bandas x 5 niveles) en escala comparable.
-    Las estadísticas se estiman SOLO sobre el split de entrenamiento (sin fuga).
+  - Normalización de intensidad ("otro"): compresión de rango dinámico con
+    signo, aplicada POR CANAL (canal = banda x nivel):
+        x = pixel / 1000
+        x_escalado = sign(x) * (sqrt(sign(x)*x + 1) - 1)
+    Es una fórmula fija (no ajusta parámetros con el train), por lo que se
+    puede aplicar por igual a train/val/test sin riesgo de fuga de datos.
 
 Pipeline:
   1. load_features       -> filtros de catálogo sobre el CSV de features.
@@ -17,9 +19,8 @@ Pipeline:
   3. align               -> intersección por desi_id y descarte de NaN.
   4. correct_extinction  -> divide cada banda por su mw_transmission (todos los niveles).
   5. split_ids           -> train/val/test.
-  6. fit_norm            -> softening (arcsinh) y mu/std por canal, en train.
-  7. apply_norm          -> arcsinh + z-score.
-  8. main                -> guarda .npz listo para el VAE.
+  6. apply_norm          -> compresión de rango dinámico "otro" (signed sqrt).
+  7. main                -> guarda .npz listo para el VAE.
 
 Uso:
     # prueba rápida (carga solo N stamps):
@@ -39,7 +40,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from astropy.stats import sigma_clipped_stats
 from sklearn.model_selection import train_test_split
 
 # --------------------------------------------------------------------------- #
@@ -227,49 +227,21 @@ def split_ids(n, stratify=None, fracs=SPLIT_FRACS, seed=RANDOM_SEED):
 
 
 # --------------------------------------------------------------------------- #
-# 6. Normalización: arcsinh + z-score por canal (canal = nivel x banda)
+# 6. Normalización "otro": signed sqrt scaling, por canal (nivel x banda)
 # --------------------------------------------------------------------------- #
-def fit_norm(X_train, max_stamps=2000, seed=RANDOM_SEED):
-    """Estima, por canal (nivel, banda), el softening del arcsinh y mu/std.
+NORM_DESCRIPTION = "x/1000 -> sign(x)*(sqrt(sign(x)*x + 1) - 1) (formula fija, sin ajuste en train)"
 
-    softening[l,b] = sigma_bg robusta (sigma-clipped) del canal, sobre un pool
-                     de píxeles de train. Hace que el arcsinh sea adaptativo al
-                     ruido: arcsinh(flux/softening) ~ lineal en el régimen de
-                     ruido y comprime las partes brillantes.
-    mu/std[l,b]    = media/desv. de t = arcsinh(flux/softening) en train.
 
-    Devuelve dict con arrays de shape (5,4).
+def apply_norm(X):
+    """Signed sqrt scaling: x/1000 -> sign(x)*(sqrt(sign(x)*x + 1) - 1).
+
+    Fórmula fija (no depende de estadísticas de train): al ser la misma
+    transformación elemento a elemento en todo canal (nivel, banda), se puede
+    aplicar directamente sobre el array completo (N,5,4,30,30) sin necesidad
+    de ajustar ni guardar parámetros por canal.
     """
-    rng = np.random.default_rng(seed)
-    n = X_train.shape[0]
-    sub = rng.choice(n, size=min(max_stamps, n), replace=False)
-
-    soft = np.zeros((N_LEVELS, len(BANDS)), dtype=np.float64)
-    mu = np.zeros_like(soft)
-    std = np.zeros_like(soft)
-
-    for l in range(N_LEVELS):
-        for b in range(len(BANDS)):
-            px = X_train[sub, l, b].ravel()
-            # sigma-clipping: aísla el fondo descartando píxeles de la galaxia.
-            _, _, sigma_bg = sigma_clipped_stats(px, sigma=3, maxiters=5)
-            sigma_bg = float(sigma_bg) if sigma_bg > 0 else 1e-3
-            soft[l, b] = sigma_bg
-
-            t = np.arcsinh(X_train[:, l, b] / sigma_bg)     # todo el train, ese canal
-            mu[l, b] = t.mean()
-            std[l, b] = t.std() if t.std() > 0 else 1.0
-
-    return {"softening": soft, "mu": mu, "std": std}
-
-
-def apply_norm(X, norm):
-    """arcsinh(flux/softening) y luego z-score, por canal. Broadcasting sobre (N,5,4,30,30)."""
-    soft = norm["softening"][None, :, :, None, None]
-    mu = norm["mu"][None, :, :, None, None]
-    std = norm["std"][None, :, :, None, None]
-    t = np.arcsinh(X / soft)
-    return ((t - mu) / std).astype(np.float32)
+    x = X / 1000.0
+    return (np.sign(x) * (np.sqrt(np.sign(x) * x + 1) - 1)).astype(np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -305,9 +277,8 @@ def main(n_max=None, out_name="vae_input.npz", tar_path=None, features_path=None
     print(f"Split  train/val/test: {len(tr)}/{len(va)}/{len(te)} "
           f"(estratificado por tipo morfológico)")
 
-    norm = fit_norm(X[tr])
-    Xn = apply_norm(X, norm)
-    print(f"\nNormalizado. rango global: "
+    Xn = apply_norm(X)
+    print(f"\nNormalizado (otro: signed sqrt scaling). rango global: "
           f"[{Xn.min():.2f}, {Xn.max():.2f}], media train≈{Xn[tr].mean():.3f}")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -319,7 +290,6 @@ def main(n_max=None, out_name="vae_input.npz", tar_path=None, features_path=None
         type=df_al["type"].to_numpy(),
         z=df_al["z"].to_numpy(),
         idx_train=tr, idx_val=va, idx_test=te,
-        softening=norm["softening"], mu=norm["mu"], std=norm["std"],
         bands=np.array(BANDS),
     )
     # Config legible aparte.
@@ -328,7 +298,7 @@ def main(n_max=None, out_name="vae_input.npz", tar_path=None, features_path=None
         "axes": "(N, nivel[5], banda[4], 30, 30)",
         "bands": BANDS,
         "depth_cut": DEPTH_CUT, "snr_min": SNR_MIN,
-        "norm": "arcsinh(flux/sigma_bg) + zscore por canal (estimado en train)",
+        "norm": NORM_DESCRIPTION,
         "split_fracs": SPLIT_FRACS, "seed": RANDOM_SEED,
     }, indent=2))
     print(f"\nGuardado: {out}")

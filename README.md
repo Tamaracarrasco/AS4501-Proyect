@@ -71,8 +71,9 @@ export COSMOS_TAR="/ruta/a/cosmos_TC_202602.tar.gz.part_aa"
 
 ### 2. Preprocesamiento → `file_out_data/vae_input.npz`
 
-Aplica los filtros (maskbits, flujo>0, profundidad, SNR, NaN), normaliza
-(arcsinh + z-score por canal) y genera el tensor `(N, 5, 4, 30, 30)` con el split
+Aplica los filtros (maskbits, flujo>0, profundidad, SNR, NaN), normaliza con
+"otro" (signed sqrt scaling: `x/1000 -> sign(x)*(sqrt(sign(x)*x + 1) - 1)`, por
+canal banda×nivel) y genera el tensor `(N, 5, 4, 30, 30)` con el split
 train/val/test **estratificado por tipo** (semilla fija → reproducible):
 
 ```bash
@@ -97,6 +98,62 @@ python scripts/VAE.py --wandb         # opcional: dashboard en vivo
 | `figures/vae/umap_*.png` | espacio latente (mu) coloreado por tipo y redshift |
 | `vae_summary.json` | métricas finales |
 | `checkpoints/vae_best.pt` | mejor modelo (menor loss de validación) |
+
+---
+
+## Alternativa: entrenar el VAE en Colab Pro desde VSCode
+
+Si no tienes GPU local (o quieres una más rápida), puedes correr `scripts/VAE.py`
+contra un runtime de **Google Colab Pro** sin salir de VSCode, usando la extensión
+oficial **"Colab"** (publisher: Google) del Marketplace. A diferencia de abrir
+colab.research.google.com en el navegador, esta extensión conecta un notebook
+`.ipynb` abierto en VSCode directamente a un runtime remoto de Colab (con GPU),
+manteniendo el editor, el resaltado y el resto de tus extensiones.
+
+1. **Instalar la extensión**: en VSCode, Extensions (`Ctrl+Shift+X`) → buscar
+   "Colab" (publisher Google) → Install.
+2. **Iniciar sesión** con la cuenta de Google que tiene la suscripción Colab Pro.
+3. **Abrir un notebook**: crea o abre un `.ipynb` (p.ej. `scripts/run_vae_colab.ipynb`).
+   En el selector de kernel (arriba a la derecha) elige el runtime de **Colab**
+   en vez de un intérprete local.
+4. **Elegir GPU Pro**: dentro de la sesión de Colab conectada, `Runtime > Change
+   runtime type` para elegir GPU (con Pro tienes acceso a GPUs mejores y más RAM
+   que en el tier gratuito).
+5. **Traer el repo y los datos** (el runtime de Colab arranca vacío) — en la
+   primera celda:
+   ```python
+   !git clone https://github.com/Tamaracarrasco/AS4501-Proyect.git
+   %cd AS4501-Proyect
+   !pip install -r requirements.txt
+   ```
+   Los datos de `/data/` pesan varios GB y no están en GitHub: súbelos a tu
+   Google Drive una vez y móntalo en cada sesión:
+   ```python
+   from google.colab import drive
+   drive.mount('/content/drive')
+   ```
+   luego usa `--tar` / `--features` (o `$COSMOS_TAR` / `$COSMOS_FEATURES`) para
+   apuntar a la ruta dentro de `/content/drive/MyDrive/...`.
+6. **Verificar la GPU**:
+   ```python
+   !nvidia-smi
+   import torch; print(torch.cuda.is_available())
+   ```
+   `VAE.py` detecta CUDA automáticamente (no hay que tocar el código).
+7. **Preprocesar y entrenar**, igual que en local pero como celdas de shell
+   (`!comando`) — corren en la máquina remota de Colab, no en tu laptop:
+   ```python
+   !python scripts/preprocess_vae.py
+   !python scripts/VAE.py --epochs 200 --z-dim 64
+   ```
+8. **Persistir resultados**: el runtime de Colab es efímero (se borra al
+   desconectar). Apunta `--out-dir` a tu Drive montado para no perder
+   checkpoints/figuras entre sesiones:
+   ```python
+   !python scripts/VAE.py --out-dir /content/drive/MyDrive/AS4501-Proyect/file_out_data
+   ```
+9. Al terminar, descarga (o copia desde Drive) el `file_out_data/` resultante a
+   tu clon local y comitea lo que quieras compartir con el equipo.
 
 ---
 
