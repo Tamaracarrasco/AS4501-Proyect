@@ -6,10 +6,11 @@ Decisiones acordadas para el VAE:
   - Filtrado ESTRICTO de la muestra: maskbits==0, flujo>0, cortes de
     profundidad (magnitud corregida por extinción) y SNR>=3 en todas las bandas,
     más eliminación de stamps con píxeles NaN.
-  - Normalización de intensidad: arcsinh + z-score POR CANAL (canal = banda x nivel).
-    El arcsinh comprime el rango dinámico (preserva el fondo ~0); el z-score
-    deja los 20 canales (4 bandas x 5 niveles) en escala comparable.
-    Las estadísticas se estiman SOLO sobre el split de entrenamiento (sin fuga).
+    - Normalización de intensidad: arcsinh + z-score CON ESCALA COMPARTIDA POR
+        NIVEL. El mismo softening y el mismo z-score se aplican a las 4 bandas de
+        cada nivel, para que el modelo vea relaciones de color bajo una escala
+        común. Las estadísticas se estiman SOLO sobre el split de entrenamiento
+        (sin fuga).
 
 Pipeline:
   1. load_features       -> filtros de catálogo sobre el CSV de features.
@@ -194,7 +195,14 @@ def correct_extinction(X, df):
     transmission = np.stack(
         [df[f"mw_transmission_{b}"].to_numpy() for b in BANDS], axis=1
     )  # (N, 4)
-    return X / transmission[:, None, :, None, None]
+    X = np.asarray(X, dtype=np.float32)
+    for b_idx in range(len(BANDS)):
+        np.divide(
+            X[:, :, b_idx],
+            transmission[:, b_idx][:, None, None, None],
+            out=X[:, :, b_idx],
+        )
+    return X
 
 
 # --------------------------------------------------------------------------- #
@@ -227,49 +235,67 @@ def split_ids(n, stratify=None, fracs=SPLIT_FRACS, seed=RANDOM_SEED):
 
 
 # --------------------------------------------------------------------------- #
-# 6. Normalización: arcsinh + z-score por canal (canal = nivel x banda)
+# 6. Normalización: arcsinh + z-score con escala compartida por nivel
 # --------------------------------------------------------------------------- #
-def fit_norm(X_train, max_stamps=2000, seed=RANDOM_SEED):
-    """Estima, por canal (nivel, banda), el softening del arcsinh y mu/std.
+def fit_norm(X, train_idx, max_stamps=2000, seed=RANDOM_SEED):
+    """Estima, por nivel, el softening del arcsinh y mu/std compartidos.
 
-    softening[l,b] = sigma_bg robusta (sigma-clipped) del canal, sobre un pool
-                     de píxeles de train. Hace que el arcsinh sea adaptativo al
-                     ruido: arcsinh(flux/softening) ~ lineal en el régimen de
-                     ruido y comprime las partes brillantes.
-    mu/std[l,b]    = media/desv. de t = arcsinh(flux/softening) en train.
+    softening[l] = sigma_bg robusta (sigma-clipped), estimada juntando las 4
+                   bandas del nivel l sobre un pool de píxeles de train. Esto
+                   fuerza una escala común entre bandas dentro de cada nivel.
+    mu/std[l]    = media/desv. de t = arcsinh(flux/softening) en train, usando
+                   el mismo softening para las 4 bandas del nivel.
 
-    Devuelve dict con arrays de shape (5,4).
+    Devuelve dict con arrays de shape (5,).
     """
     rng = np.random.default_rng(seed)
-    n = X_train.shape[0]
-    sub = rng.choice(n, size=min(max_stamps, n), replace=False)
+    n = len(train_idx)
+    sub_pos = rng.choice(n, size=min(max_stamps, n), replace=False)
+    sub_idx = np.asarray(train_idx)[sub_pos]
 
-    soft = np.zeros((N_LEVELS, len(BANDS)), dtype=np.float64)
+    soft = np.zeros(N_LEVELS, dtype=np.float64)
     mu = np.zeros_like(soft)
     std = np.zeros_like(soft)
 
     for l in range(N_LEVELS):
-        for b in range(len(BANDS)):
-            px = X_train[sub, l, b].ravel()
-            # sigma-clipping: aísla el fondo descartando píxeles de la galaxia.
-            _, _, sigma_bg = sigma_clipped_stats(px, sigma=3, maxiters=5)
-            sigma_bg = float(sigma_bg) if sigma_bg > 0 else 1e-3
-            soft[l, b] = sigma_bg
+        px = X[sub_idx, l].ravel()
+        # sigma-clipping: aísla el fondo descartando píxeles de la galaxia.
+        _, _, sigma_bg = sigma_clipped_stats(px, sigma=3, maxiters=5)
+        sigma_bg = float(sigma_bg) if sigma_bg > 0 else 1e-3
+        soft[l] = sigma_bg
 
-            t = np.arcsinh(X_train[:, l, b] / sigma_bg)     # todo el train, ese canal
-            mu[l, b] = t.mean()
-            std[l, b] = t.std() if t.std() > 0 else 1.0
+        count = 0
+        total = 0.0
+        total_sq = 0.0
+        for start in range(0, n, 256):
+            batch_idx = train_idx[start:start + 256]
+            chunk = np.arcsinh(X[batch_idx, l] / sigma_bg)
+            chunk64 = chunk.astype(np.float64, copy=False)
+            total += chunk64.sum()
+            total_sq += np.square(chunk64).sum()
+            count += chunk64.size
+        mu[l] = total / count
+        variance = total_sq / count - mu[l] ** 2
+        std[l] = np.sqrt(variance) if variance > 0 else 1.0
 
     return {"softening": soft, "mu": mu, "std": std}
 
 
 def apply_norm(X, norm):
-    """arcsinh(flux/softening) y luego z-score, por canal. Broadcasting sobre (N,5,4,30,30)."""
-    soft = norm["softening"][None, :, :, None, None]
-    mu = norm["mu"][None, :, :, None, None]
-    std = norm["std"][None, :, :, None, None]
-    t = np.arcsinh(X / soft)
-    return ((t - mu) / std).astype(np.float32)
+    """arcsinh(flux/softening) y luego z-score, con escala compartida por nivel.
+
+    Se aplica in-place para evitar otra copia completa del tensor.
+    """
+    X = np.asarray(X, dtype=np.float32)
+    soft = norm["softening"]
+    mu = norm["mu"]
+    std = norm["std"]
+    for l in range(N_LEVELS):
+        np.divide(X[:, l], soft[l], out=X[:, l])
+        np.arcsinh(X[:, l], out=X[:, l])
+        X[:, l] -= mu[l]
+        X[:, l] /= std[l]
+    return X.astype(np.float32, copy=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -297,6 +323,7 @@ def main(n_max=None, out_name="vae_input.npz", tar_path=None, features_path=None
 
     ids, X, df_al = align(df, stamps)
     print(f"\nMuestra final alineada: N={len(ids)}, X.shape={X.shape}")
+    del stamps
 
     X = correct_extinction(X, df_al)
     print("Stamps corregidos por extinción galáctica (mw_transmission por banda).")
@@ -305,7 +332,7 @@ def main(n_max=None, out_name="vae_input.npz", tar_path=None, features_path=None
     print(f"Split  train/val/test: {len(tr)}/{len(va)}/{len(te)} "
           f"(estratificado por tipo morfológico)")
 
-    norm = fit_norm(X[tr])
+    norm = fit_norm(X, tr)
     Xn = apply_norm(X, norm)
     print(f"\nNormalizado. rango global: "
           f"[{Xn.min():.2f}, {Xn.max():.2f}], media train≈{Xn[tr].mean():.3f}")
@@ -328,7 +355,7 @@ def main(n_max=None, out_name="vae_input.npz", tar_path=None, features_path=None
         "axes": "(N, nivel[5], banda[4], 30, 30)",
         "bands": BANDS,
         "depth_cut": DEPTH_CUT, "snr_min": SNR_MIN,
-        "norm": "arcsinh(flux/sigma_bg) + zscore por canal (estimado en train)",
+        "norm": "arcsinh(flux/sigma_bg) + zscore con escala compartida por nivel (estimado en train)",
         "split_fracs": SPLIT_FRACS, "seed": RANDOM_SEED,
     }, indent=2))
     print(f"\nGuardado: {out}")
