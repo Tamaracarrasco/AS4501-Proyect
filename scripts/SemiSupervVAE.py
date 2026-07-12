@@ -90,6 +90,7 @@ CONFIG = {
     "use_wandb": False,
     "wandb_project": "cosmos-vae",
     "wandb_run": None,
+    "data_augmentation": False
 }
 
 BAND_NAMES = ["g", "r", "i", "z"]
@@ -170,6 +171,22 @@ def load_data(config, device):
         "z_std": z_std,
     }
 
+def data_augmentation(x):
+    """Aplicamos rotaciones en múltiplos de 90 grados y reflexiones aleatorias a un batch de tensores"""
+
+    # Número de rotaciones (0, 1, 2, 3) que corresponden a 0°, 90°, 180° y 270°
+    k = torch.randint(0, 4, (x.size(0),), device=x.device)
+
+    # Aplicamos la rotación a cada imagen en el batch
+    x_rot = torch.stack([torch.rot90(x[i], int(k[i]), dims=[-2, -1]) for i in range(x.size(0))])
+
+    # Asignamos una probabilidad de 0.5 para reflejar horizontalmente
+    flip_idx = torch.rand(x.size(0), device=x.device) < 0.5
+
+    if flip_idx.any():
+        x_rot[flip_idx] = torch.flip(x_rot[flip_idx], dims=[-1])  # Reflejo horizontal
+    
+    return x_rot
 
 class EncoderBranch(nn.Module):
     def __init__(self, base_ch, branch_dim):
@@ -320,13 +337,15 @@ def kl_per_dim(mu, logvar):
     return (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp())).mean(dim=0)
 
 
-def train_epoch(model, loader, opt, beta, z_weight, device, grad_clip):
+def train_epoch(model, loader, opt, beta, z_weight, device, grad_clip, data_aug_enabled=False):
     model.train()
     tot = rec = kl = zloss = 0.0
     n = 0
     for x, z, _ in loader:
         x = x.to(device)
         z = z.to(device)
+        if data_aug_enabled:
+            x = data_augmentation(x)  # Aplicamos data augmentation al batch de entrada
         opt.zero_grad()
         recon, mu, logvar, z_sup = model(x)
         loss, r, k, zl = semisuperv_loss(recon, x, mu, logvar, z_sup, z, beta, z_weight)
@@ -626,6 +645,45 @@ git_commit    : {commit}
         if self.use_wandb:
             wandb.finish()
 
+    def save_loss_curves(self):
+        if not self.history:
+            return
+
+        epochs = [row["epoch"] for row in self.history]
+
+        recon_tr = [row["loss/recon_train"] for row in self.history]
+        recon_va = [row["loss/recon_val"] for row in self.history]
+        kl_tr = [row["loss/kl_train"] for row in self.history]
+        kl_va = [row["loss/kl_val"] for row in self.history]
+        z_tr = [row["loss/z_train"] for row in self.history]
+        z_va = [row["loss/z_val"] for row in self.history]
+
+        fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+
+        axes[0].plot(epochs, recon_tr, label="train", lw=2)
+        axes[0].plot(epochs, recon_va, label="val", lw=2, ls="--")
+        axes[0].set_ylabel("recon")
+        axes[0].set_yscale("log")
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+
+        axes[1].plot(epochs, kl_tr, label="train", lw=2)
+        axes[1].plot(epochs, kl_va, label="val", lw=2, ls="--")
+        axes[1].set_ylabel("kl")
+        axes[1].set_yscale("log")
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend()
+
+        axes[2].plot(epochs, z_tr, label="train", lw=2)
+        axes[2].plot(epochs, z_va, label="val", lw=2, ls="--")
+        axes[2].set_ylabel("z_MSE")
+        axes[2].set_xlabel("epoch")
+        axes[2].grid(True, alpha=0.3)
+        axes[2].legend()
+
+        fig.suptitle("SemiSupervVAE losses per epoch")
+        plt.tight_layout()
+        self.save_fig(fig, "loss_curves.png")
 
 def main(config=CONFIG, epoch_callback=None):
     set_seed(config["seed"])
@@ -662,7 +720,7 @@ def main(config=CONFIG, epoch_callback=None):
 
     for epoch in range(1, config["epochs"] + 1):
         beta = beta_schedule(epoch, config)
-        tr = train_epoch(model, data["train_loader"], opt, beta, config["z_reg_weight"], device, config["grad_clip"])
+        tr = train_epoch(model, data["train_loader"], opt, beta, config["z_reg_weight"], device, config["grad_clip"], config["data_augmentation"])
         heavy = (epoch % config["metrics_every"] == 0)
         val = validate(model, data["val_loader"], device, config, image_metrics=heavy)
         sched.step(val["total"])
@@ -687,6 +745,7 @@ def main(config=CONFIG, epoch_callback=None):
             "beta": beta,
             "lr": lr_now,
         })
+        logger.save_loss_curves()
         print(
             f"e{epoch:03d} | beta={beta:.3f} | "
             f"train tot={tr['total']:.1f} rec={tr['recon']:.1f} kl={tr['kl']:.1f} z={tr['z_loss']:.3f} | "
@@ -744,6 +803,7 @@ def main(config=CONFIG, epoch_callback=None):
     }
     logger.summary_path.write_text(json.dumps(summary, indent=2))
     print("resumen:", json.dumps(summary, indent=2))
+    logger.save_loss_curves()
     logger.finish()
     return model
 
@@ -763,6 +823,7 @@ if __name__ == "__main__":
     ap.add_argument("--run-id", type=int)
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--no-share", action="store_true")
+    ap.add_argument("--data-augmentation", action="store_true")
     args = ap.parse_args()
 
     cfg = dict(CONFIG)
@@ -792,5 +853,6 @@ if __name__ == "__main__":
         cfg["use_wandb"] = True
     if args.no_share:
         cfg["share_level_weights"] = False
-
+    if args.data_augmentation:
+        cfg["data_augmentation"] = True
     main(cfg)
