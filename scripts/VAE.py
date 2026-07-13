@@ -569,7 +569,7 @@ def latent_umap(model, data, device, config, epoch, logger):
                          c=data["z_val"], cmap="viridis")
     plt.colorbar(sc, ax=axes[1], label="z (redshift)")
     axes[1].set_title("redshift")
-    fig.suptitle(f"Espacio latente ({method}, mu) — época {epoch}")
+    fig.suptitle(f"Espacio latente ({method}, mu) - época {epoch}")
     plt.tight_layout()
     logger.save_fig(fig, f"umap_e{epoch:04d}.png", wandb_key="latent_umap")
 
