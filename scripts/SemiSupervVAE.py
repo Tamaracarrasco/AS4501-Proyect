@@ -488,6 +488,9 @@ def latent_umap(model, data, device, config, epoch, logger):
     mu = np.concatenate(mus, axis=0)
     z_sup = np.concatenate(z_sup, axis=0).reshape(-1)
     z_true = data["z_val_raw"].reshape(-1)
+    z_pred = z_sup * data["z_std"] + data["z_mean"]
+    delta_z = (z_pred - z_true) / (1.0 + z_true)
+    eta = float((np.abs(delta_z) > 0.05).mean() * 100.0)
 
     if HAS_UMAP:
         emb = umap.UMAP(n_components=2, random_state=config["seed"]).fit_transform(mu)
@@ -507,13 +510,28 @@ def latent_umap(model, data, device, config, epoch, logger):
     sc = axes[1].scatter(emb[:, 0], emb[:, 1], s=6, alpha=0.6, c=z_true, cmap="viridis")
     plt.colorbar(sc, ax=axes[1], label="z (redshift)")
     axes[1].set_title("redshift")
-    axes[2].scatter(z_true, z_sup * data["z_std"] + data["z_mean"], s=8, alpha=0.6)
-    lo = min(z_true.min(), (z_sup * data["z_std"] + data["z_mean"]).min())
-    hi = max(z_true.max(), (z_sup * data["z_std"] + data["z_mean"]).max())
-    axes[2].plot([lo, hi], [lo, hi], "k--", lw=1)
+    axes[2].scatter(z_true, z_pred, s=8, alpha=0.6)
+    lo = min(z_true.min(), z_pred.min())
+    hi = max(z_true.max(), z_pred.max())
+    axes[2].plot([lo, hi], [lo, hi], "k--", lw=1, label="1:1")
+    z_line = np.linspace(lo, hi, 200)
+    threshold = 0.05
+    axes[2].plot(z_line, z_line + threshold * (1 + z_line), color="red", lw=1.5, label=f"|dz| > {threshold}")
+    axes[2].plot(z_line, z_line - threshold * (1 + z_line), color="red", lw=1.5)
     axes[2].set_xlabel("z real")
     axes[2].set_ylabel("z predicho por latent")
     axes[2].set_title("coordenada supervisada")
+    axes[2].text(
+        0.05,
+        0.95,
+        f"eta = {eta:.3f}%",
+        transform=axes[2].transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.8, edgecolor="none"),
+    )
+    axes[2].legend(loc="lower right", fontsize=8)
     fig.suptitle(f"Espacio latente ({method}, mu_vae) - epoca {epoch}")
     plt.tight_layout()
     logger.save_fig(fig, f"latent_e{epoch:04d}.png", wandb_key="latent_umap")
