@@ -245,7 +245,7 @@ def split_ids(n, stratify=None, fracs=SPLIT_FRACS, seed=RANDOM_SEED):
 # normalizado colapsaba a ~[-0.00, 0.03] (sin compresión real, todo en el
 # regimen lineal del sqrt). Con /0.1 el "codo" de compresión cae donde empieza
 # el flujo de las fuentes por sobre el ruido de fondo.
-NORM_SCALE = 0.1
+NORM_SCALE = 29.8
 NORM_DESCRIPTION = f"x/{NORM_SCALE} -> sign(x)*(sqrt(sign(x)*x + 1) - 1) (formula fija, sin ajuste en train)"
 
 
