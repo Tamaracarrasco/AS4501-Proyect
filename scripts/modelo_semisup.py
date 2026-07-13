@@ -134,6 +134,7 @@ CONFIG = {
     "beta_final":   1.0,       # peso final de la KL
     "warmup_epochs": 30,       # epocas de warm-up lineal de beta (0 -> beta_final)
     "alpha_redshift": 1.0,     # peso de la loss del regresor de redshift
+    "eta_threshold": 0.05,     # umbral |delta_z| para error catastrofico (igual a Regresion_RF2.ipynb)
     "active_kl_thresh": 0.01,  # umbral KL/dim para contar dims "activas"
     "metrics_every": 10,       # cada cuantas epocas se calculan SSIM/PSNR (caras);
                                # la val-loss (early stopping) se calcula SIEMPRE
@@ -462,17 +463,21 @@ def kl_per_dim(mu, logvar):
 # =========================================================================== #
 # 3b. Metricas de photo-z
 # =========================================================================== #
-def photoz_metrics(z_pred, z_true):
+def photoz_metrics(z_pred, z_true, eta_threshold=0.05):
     """Calcula las metricas estandar de photo-z.
 
     Retorna dict con bias, sigma_MAD, eta (fraccion de errores catastroficos)
     y RMSE, todos calculados sobre el residuo normalizado
     delta_z = (z_pred - z_true) / (1 + z_true).
+
+    eta_threshold : umbral de |delta_z| para considerar un error catastrofico
+        (default 0.05, igual al usado en scripts/ML/Regresion_RF2.ipynb para
+        que las metricas sean comparables entre el regresor del VAE y el RF).
     """
     dz = (z_pred - z_true) / (1.0 + z_true)
     bias = float(np.median(dz))
     sigma_mad = 1.4826 * float(np.median(np.abs(dz - np.median(dz))))
-    eta = float(np.mean(np.abs(dz) > 0.15)) * 100.0      # porcentaje
+    eta = float(np.mean(np.abs(dz) > eta_threshold)) * 100.0      # porcentaje
     rmse = float(np.sqrt(np.mean(dz ** 2)))
     return {"bias": bias, "sigma_mad": sigma_mad, "eta": eta, "rmse": rmse}
 
@@ -559,7 +564,7 @@ def validate(model, loader, device, config, image_metrics=True):
     z_mean, z_std = config["z_mean"], config["z_std"]
     zpred_all = np.concatenate(all_zpred) * z_std + z_mean
     ztrue_all = np.concatenate(all_ztrue) * z_std + z_mean
-    pz = photoz_metrics(zpred_all, ztrue_all)
+    pz = photoz_metrics(zpred_all, ztrue_all, eta_threshold=config["eta_threshold"])
 
     out = {"total": tot / n, "recon": rec / n, "kl": kl_sum / n, "reg": reg_sum / n,
            "mse_px": mse_px / n, "kl_per_dim_mean": float(kld.mean()),
@@ -670,10 +675,11 @@ def latent_umap(model, data, device, config, epoch, logger):
 def save_photoz_scatter(model, data, device, config, epoch, logger):
     """Scatter z_pred vs z_spec con rectas de errores catastroficos.
 
-    Errores catastroficos: |z_pred - z_spec| / (1 + z_spec) > 0.15.
-    Las rectas limites son:
-        superior: z_pred = 1.15 * z_spec + 0.15
-        inferior: z_pred = 0.85 * z_spec - 0.15
+    Errores catastroficos: |z_pred - z_spec| / (1 + z_spec) > eta_threshold
+    (config['eta_threshold'], default 0.05, igual al usado en
+    scripts/ML/Regresion_RF2.ipynb). Las rectas limites son:
+        superior: z_pred = (1+eta_threshold) * z_spec + eta_threshold
+        inferior: z_pred = (1-eta_threshold) * z_spec - eta_threshold
     """
     model.eval()
     X_val = data["X_val"]
@@ -689,7 +695,8 @@ def save_photoz_scatter(model, data, device, config, epoch, logger):
     z_pred = np.concatenate(preds) * config["z_std"] + config["z_mean"]
     z_spec = data["z_val"]
 
-    pz = photoz_metrics(z_pred, z_spec)
+    eta_th = config["eta_threshold"]
+    pz = photoz_metrics(z_pred, z_spec, eta_threshold=eta_th)
 
     # rango para las rectas
     z_min = min(z_spec.min(), z_pred.min()) - 0.02
@@ -700,14 +707,14 @@ def save_photoz_scatter(model, data, device, config, epoch, logger):
     ax.scatter(z_spec, z_pred, s=4, alpha=0.4, c="#0072B2", rasterized=True)
 
     # recta identidad
-    ax.plot(z_line, z_line, color="#999999", linewidth=1.2, label="y = x")
+    ax.plot(z_line, z_line, color="black", linewidth=1.2, label="y = x")
 
     # limites de errores catastroficos
-    upper = 1.15 * z_line + 0.15
-    lower = 0.85 * z_line - 0.15
-    ax.plot(z_line, upper, color="#D55E00", linewidth=1.0, linestyle="--",
-            label=r"$|\Delta z|/(1+z) = 0.15$")
-    ax.plot(z_line, lower, color="#D55E00", linewidth=1.0, linestyle="--")
+    upper = (1 + eta_th) * z_line + eta_th
+    lower = (1 - eta_th) * z_line - eta_th
+    ax.plot(z_line, upper, color="red", linewidth=2.0, linestyle="--",
+            label=rf"$|\Delta z|/(1+z) = {eta_th:g}$")
+    ax.plot(z_line, lower, color="red", linewidth=2.0, linestyle="--")
 
     ax.set_xlabel(r"$z_{\rm spec}$", fontsize=13)
     ax.set_ylabel(r"$z_{\rm pred}$", fontsize=13)
