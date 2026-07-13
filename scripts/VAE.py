@@ -5,7 +5,9 @@ Input (producido por preprocess_vae.py):  X de shape (N, 5, 4, 30, 30)
     eje 1 -> 5 niveles de resolución (ramas)
     eje 2 -> 4 bandas g,r,i,z (canales de cada rama)
     datos ya normalizados con "otro" (compresión de rango dinámico con signo):
-        x = pixel/1000; x_escalado = sign(x)*(sqrt(sign(x)*x + 1) - 1)
+        x = pixel/0.1; x_escalado = sign(x)*(sqrt(sign(x)*x + 1) - 1)
+        (NORM_SCALE=0.1, calibrado a la escala real del flujo de este dataset;
+        ver preprocess_vae.py)
 
 Arquitectura tentativa:
     - 5 ramas, una por nivel de resolución. CADA RAMA COMPARTE LOS PESOS
@@ -631,7 +633,7 @@ class Logger:
 data_path     : {config['data_path']}
 X_shape       : {data['x_shape']}    # (N, niveles, bandas, H, W)
 bands         : {', '.join(data['bands'])}
-norm          : "otro" (signed sqrt): x/1000 -> sign(x)*(sqrt(sign(x)*x+1)-1), fórmula fija sin ajuste en train
+norm          : "otro" (signed sqrt): x/0.1 -> sign(x)*(sqrt(sign(x)*x+1)-1), fórmula fija sin ajuste en train
 split         : train/val/test = {data['n_train']}/{data['n_val']}/{data['n_test']}  (estratif. por tipo, seed {config['seed']})
 
 [latente]

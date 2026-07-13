@@ -4,7 +4,8 @@ VAE convolucional multi-resolucion para stamps + regresor de redshift
 Input (producido por preprocess_vae.py):  X de shape (N, 5, 4, 30, 30)
     eje 1 -> 5 niveles de resolucion (ramas)
     eje 2 -> 4 bandas g,r,i,z (canales de cada rama)
-    datos ya normalizados ("otro"): x/1000 -> sign(x)*(sqrt(sign(x)*x + 1) - 1).
+    datos ya normalizados ("otro"): x/0.1 -> sign(x)*(sqrt(sign(x)*x + 1) - 1).
+    (NORM_SCALE=0.1, calibrado a la escala real del flujo; ver preprocess_vae.py)
 
 Arquitectura:
     - 5 ramas, una por nivel de resolucion. CADA RAMA COMPARTE LOS PESOS
@@ -810,7 +811,7 @@ class Logger:
 data_path     : {config['data_path']}
 X_shape       : {data['x_shape']}    # (N, niveles, bandas, H, W)
 bands         : {', '.join(data['bands'])}
-norm          : x/1000 -> sign(x)*(sqrt(sign(x)*x + 1) - 1)  ("otro", formula fija)
+norm          : x/0.1 -> sign(x)*(sqrt(sign(x)*x + 1) - 1)  ("otro", formula fija)
 split         : train/val/test = {data['n_train']}/{data['n_val']}/{data['n_test']}  (estratif. por tipo, seed {config['seed']})
 
 [latente]

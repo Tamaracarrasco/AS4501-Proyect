@@ -72,8 +72,9 @@ export COSMOS_TAR="/ruta/a/cosmos_TC_202602.tar.gz.part_aa"
 ### 2. Preprocesamiento → `file_out_data/vae_input.npz`
 
 Aplica los filtros (maskbits, flujo>0, profundidad, SNR, NaN), normaliza con
-"otro" (signed sqrt scaling: `x/1000 -> sign(x)*(sqrt(sign(x)*x + 1) - 1)`, por
-canal banda×nivel) y genera el tensor `(N, 5, 4, 30, 30)` con el split
+"otro" (signed sqrt scaling: `x/0.1 -> sign(x)*(sqrt(sign(x)*x + 1) - 1)`,
+constante global fija, calibrada a la escala real del flujo del dataset) y
+genera el tensor `(N, 5, 4, 30, 30)` con el split
 train/val/test **estratificado por tipo** (semilla fija → reproducible):
 
 ```bash

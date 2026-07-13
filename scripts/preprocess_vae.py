@@ -8,10 +8,20 @@ Decisiones acordadas para el VAE:
     más eliminación de stamps con píxeles NaN.
   - Normalización de intensidad ("otro"): compresión de rango dinámico con
     signo, aplicada a todo el tensor:
-        x = pixel / 1000
+        x = pixel / NORM_SCALE   (NORM_SCALE = 0.1)
         x_escalado = sign(x) * (sqrt(sign(x)*x + 1) - 1)
     Es una fórmula fija (no ajusta parámetros con el train), por lo que se
     puede aplicar por igual a train/val/test sin riesgo de fuga de datos.
+    NORM_SCALE=0.1 (no 1000): el flujo crudo de este dataset, post-corrección
+    por extinción, es MUY chico (percentil 50/90/99/99.9 ~= 0.001/0.013/0.15/0.83,
+    max de orden decenas) -> dividir por 1000 dejaba todo en el régimen lineal
+    del sqrt (x<<1, sin ninguna compresión real; el rango normalizado global
+    colapsaba a ~[-0.00, 0.03]). Con /0.1 el "codo" de compresión cae justo
+    donde empieza el flujo de las fuentes (encima del ruido de fondo), y los
+    picos brillantes sí se comprimen. NORM_SCALE es global (no por canal),
+    así que el ruido de fondo entre niveles (varía ~10x de nivel 0 a nivel 4)
+    queda comprimido de forma desigual entre niveles -> limitación conocida y
+    aceptada de mantener una única constante fija para todo el tensor.
 
 Pipeline:
   1. load_features       -> filtros de catálogo sobre el CSV de features.
@@ -227,20 +237,30 @@ def split_ids(n, stratify=None, fracs=SPLIT_FRACS, seed=RANDOM_SEED):
 
 
 # --------------------------------------------------------------------------- #
-# 6. Normalización "otro": signed sqrt scaling, por canal (nivel x banda)
+# 6. Normalización "otro": signed sqrt scaling, global (no por canal)
 # --------------------------------------------------------------------------- #
-NORM_DESCRIPTION = "x/1000 -> sign(x)*(sqrt(sign(x)*x + 1) - 1) (formula fija, sin ajuste en train)"
+# NORM_SCALE: constante global fija (no se ajusta con train). Calibrada para
+# este dataset a partir del flujo real post-extinción (percentil 50/90/99/99.9
+# ~= 0.001/0.013/0.15/0.83, ver docstring del modulo) -> con /1000 el rango
+# normalizado colapsaba a ~[-0.00, 0.03] (sin compresión real, todo en el
+# regimen lineal del sqrt). Con /0.1 el "codo" de compresión cae donde empieza
+# el flujo de las fuentes por sobre el ruido de fondo.
+NORM_SCALE = 0.1
+NORM_DESCRIPTION = f"x/{NORM_SCALE} -> sign(x)*(sqrt(sign(x)*x + 1) - 1) (formula fija, sin ajuste en train)"
 
 
 def apply_norm(X):
-    """Signed sqrt scaling: x/1000 -> sign(x)*(sqrt(sign(x)*x + 1) - 1).
+    """Signed sqrt scaling: x/NORM_SCALE -> sign(x)*(sqrt(sign(x)*x + 1) - 1).
 
     Fórmula fija (no depende de estadísticas de train): al ser la misma
     transformación elemento a elemento en todo canal (nivel, banda), se puede
     aplicar directamente sobre el array completo (N,5,4,30,30) sin necesidad
-    de ajustar ni guardar parámetros por canal.
+    de ajustar ni guardar parámetros por canal. NORM_SCALE es UNA constante
+    global (no por canal) -> el ruido de fondo entre niveles de resolución
+    (varía ~10x de nivel 0 a nivel 4) queda comprimido de forma desigual entre
+    niveles; es una limitación conocida de mantener una sola constante fija.
     """
-    x = X / 1000.0
+    x = X / NORM_SCALE
     return (np.sign(x) * (np.sqrt(np.sign(x) * x + 1) - 1)).astype(np.float32)
 
 
