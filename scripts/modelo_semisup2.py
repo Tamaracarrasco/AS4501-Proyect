@@ -1,0 +1,1023 @@
+"""
+VAE convolucional multi-resolucion para stamps + regresor de redshift
+
+Input (producido por preprocess_vae.py):  X de shape (N, 5, 4, 30, 30)
+    eje 1 -> 5 niveles de resolucion (ramas)
+    eje 2 -> 4 bandas g,r,i,z (canales de cada rama)
+    datos ya normalizados ("otro"): x/1000 -> sign(x)*(sqrt(sign(x)*x + 1) - 1).
+
+Arquitectura:
+    - 5 ramas, una por nivel de resolucion. CADA RAMA COMPARTE LOS PESOS
+      (un unico encoder convolucional se aplica a los 5 niveles -> Siamese).
+      Justificacion: los 5 niveles son distintos FOV del MISMO objeto; un
+      extractor de features compartido es eficiente en parametros y fuerza una
+      representacion consistente de la estructura a traves de las escalas.
+      La interaccion entre niveles ocurre en la capa de fusion.
+    - Cada rama: Conv2d -> BatchNorm -> LeakyReLU, reduciendo 30->15->8->4.
+    - Los 5 vectores de rama se concatenan y una MLP de fusion produce mu/logvar.
+    - Decoder simetrico: z -> fusion inversa -> 5 vectores -> rama decoder
+      compartida (PixelShuffle) -> reconstruccion (N,5,4,30,30).
+    - Regresor de redshift: MLP sobre mu (z_dim -> z_dim*2 -> 1).
+      Usa mu (no z muestreado) porque es la estimacion determinista del
+      espacio latente, lo que da predicciones estables en train y en eval.
+
+Perdida conjunta:
+    L = L_recon + beta * L_KL + alpha * L_redshift
+    donde L_redshift = MSE(z_pred_norm, z_spec_norm), con z_spec_norm el
+    redshift espectroscopico estandarizado (z-score, media/std calculados
+    SOLO sobre train, para no filtrar informacion de val/test). El regresor
+    predice en esa escala normalizada; para metricas de photo-z y el scatter
+    z_pred vs z_spec se revierte la normalizacion (z = z_norm*std + mean)
+    antes de compararlo con el valor fisico.
+
+Decisiones de diseno no obvias (ver tambien comentarios inline):
+    - Salida del decoder LINEAL (identidad): la normalizacion "otro" deja los
+      datos con signo y sin acotar a un rango fijo (no en [0,1]) -> verosimilitud
+      gaussiana -> perdida MSE. (Si fueran [0,1] se usaria sigmoide + BCE.)
+    - Recon = SUMA por imagen (no media) para que su escala sea comparable a la
+      KL (que tambien es suma sobre dims latentes). Si se promediara por pixel,
+      la KL aplastaria todo y habria posterior collapse.
+    - KL annealing: beta sube 0 -> beta_final linealmente en las primeras
+      `warmup_epochs`. Evita que al inicio la KL fuerce q(z|x)=N(0,I) (collapse).
+    - Seleccion de modelo (early stopping / checkpoint / scheduler) usa la loss
+      de validacion evaluada SIEMPRE con beta_final (objetivo estacionario),
+      aunque el entrenamiento use la beta annealed -> metrica comparable entre epocas.
+    - PixelShuffle (sub-pixel conv) en el decoder en vez de upsample bilineal: el
+      bilineal es pasa-bajos y borronea (se verifico que NO lograba ni overfittear
+      64 stamps); PixelShuffle aprende el upsampling y evita el checkerboard de
+      ConvTranspose.
+
+Uso en Colab Pro desde la extension "Colab" de VSCode (GPU remota, sin salir
+del editor; guia completa paso a paso en el README, seccion "Alternativa:
+entrenar el VAE en Colab Pro desde VSCode"):
+    # 1. Extensions de VSCode -> instalar "Colab" (publisher Google) -> iniciar
+    #    sesion con la cuenta que tiene Colab Pro.
+    # 2. Abrir un .ipynb en VSCode y elegir el runtime "Colab" en el selector
+    #    de kernel (no un interprete local); Runtime > Change runtime type
+    #    para elegir GPU.
+    # 3. En la primera celda, traer el repo y los datos:
+    !git clone https://github.com/Tamaracarrasco/AS4501-Proyect.git
+    %cd AS4501-Proyect
+    !pip install -r requirements.txt
+    from google.colab import drive; drive.mount('/content/drive')  # si los datos estan en Drive
+    # 4. Entrenar como celda de shell (--data/--out-dir a rutas de Drive/content
+    #    para que los checkpoints y figuras sobrevivan a que el runtime se recicle):
+    !python scripts/VAE.py --out-dir /content/drive/MyDrive/AS4501-Proyect/file_out_data
+
+Local (CPU, env astro), prueba rapida:
+    /opt/miniconda3/envs/astro/bin/python scripts/VAE.py
+    (si umap no esta instalado, la visualizacion latente cae a PCA 2D)
+"""
+
+import argparse
+import json
+import math
+import os
+import random
+import re
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# --- imports opcionales (Colab los tiene tras pip install; local pueden faltar) ---
+try:
+    import umap
+    HAS_UMAP = True
+except Exception:
+    HAS_UMAP = False
+
+try:
+    import wandb
+    HAS_WANDB = True
+except Exception:
+    HAS_WANDB = False
+
+try:
+    from torchmetrics.functional import (
+        structural_similarity_index_measure as _ssim,
+        peak_signal_noise_ratio as _psnr,
+    )
+    HAS_TM = True
+except Exception:
+    HAS_TM = False
+
+
+# =========================================================================== #
+# CONFIG  -- todos los hiperparametros centralizados
+# =========================================================================== #
+_REPO = Path(__file__).resolve().parent.parent
+
+CONFIG = {
+    "data_path": os.environ.get("VAE_DATA", str(_REPO / "file_out_data" / "vae_input.npz")),
+    "out_dir":   os.environ.get("VAE_OUT", str(_REPO / "file_out_data")),
+    "run_id":    None,
+
+    # arquitectura
+    "z_dim":        64,
+    "branch_dim":   128,
+    "fusion_dim":   256,
+    "base_ch":      64,
+    "share_level_weights": True,
+
+    # perdida
+    "beta_final":   1.0,
+    "warmup_epochs": 30,
+    "alpha_redshift": 1.0,
+    "eta_threshold": 0.05,
+    "active_kl_thresh": 0.01,
+    "metrics_every": 10,
+
+    # entrenamiento
+    "lr":           1e-3,
+    "batch_size":   128,
+    "epochs":       200,
+    "grad_clip":    5.0,
+    "patience":     25,
+    "sched_patience": 8,
+    "num_workers":  2,
+    "seed":         42,
+
+    # visualizacion / monitoreo
+    "fig_every":    50,
+    "viz_level":    2,
+    "viz_mode":     "rgb",
+    "viz_band":     1,
+    "n_viz":        8,
+
+    # wandb
+    "use_wandb":     False,
+    "wandb_project": "cosmos-vae",
+    "wandb_run":     None,
+}
+
+BAND_NAMES = ["g", "r", "i", "z"]
+N_LEVELS = 5
+N_BANDS = 4
+IMG = 30
+
+
+# =========================================================================== #
+# 0. Reproducibilidad
+# =========================================================================== #
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# =========================================================================== #
+# 1. Datos: mini-batches residentes en GPU
+# =========================================================================== #
+class GPUBatches:
+    """Itera mini-batches de un tensor que YA vive en la GPU.
+
+    Si se pasa Y (tensor de etiquetas, e.g. redshifts), se entrega junto con X
+    en cada batch. Si Y es None, el segundo elemento del yield es None.
+    """
+
+    def __init__(self, X, batch_size, device, shuffle, seed=42, drop_last=False,
+                 Y=None):
+        self.X = X.to(device)
+        self.Y = Y.to(device) if Y is not None else None
+        self.bs = batch_size
+        self.shuffle = shuffle
+        self.device = device
+        self.drop_last = drop_last
+        self.g = torch.Generator().manual_seed(seed)
+
+    def __len__(self):
+        n = self.X.shape[0]
+        return n // self.bs if self.drop_last else (n + self.bs - 1) // self.bs
+
+    def __iter__(self):
+        n = self.X.shape[0]
+        idx = torch.randperm(n, generator=self.g) if self.shuffle else torch.arange(n)
+        idx = idx.to(self.device)
+        last = n - (n % self.bs) if self.drop_last else n
+        for i in range(0, last, self.bs):
+            sel = idx[i:i + self.bs]
+            y_batch = self.Y[sel] if self.Y is not None else None
+            yield self.X[sel], y_batch, sel
+
+
+def load_data(config, device):
+    """Carga el .npz, sube train/val a la GPU y arma los batchers (GPUBatches).
+
+    La media/std del redshift se calculan solo sobre train (evita fuga de datos)
+    y se devuelven en el dict para poder revertir la normalizacion al calcular
+    metricas/figuras en escala fisica.
+    """
+    d = np.load(config["data_path"], allow_pickle=True)
+    X = d["X"]
+    tr, va = d["idx_train"], d["idx_val"]
+    te = d["idx_test"] if "idx_test" in d else np.array([], dtype=int)
+    types = d["type"];  zred = d["z"].astype(np.float64)
+    bands = [str(b) for b in d["bands"]] if "bands" in d else BAND_NAMES
+
+    Xtr = torch.as_tensor(X[tr], dtype=torch.float32).to(device)
+    Xva = torch.as_tensor(X[va], dtype=torch.float32).to(device)
+
+    z_mean = float(zred[tr].mean())
+    z_std = float(zred[tr].std())
+    z_norm = (zred - z_mean) / z_std
+
+    z_tr = torch.as_tensor(z_norm[tr], dtype=torch.float32).to(device)
+    z_va = torch.as_tensor(z_norm[va], dtype=torch.float32).to(device)
+
+    train_loader = GPUBatches(Xtr, config["batch_size"], device,
+                              shuffle=True, seed=config["seed"], drop_last=True,
+                              Y=z_tr)
+    val_loader = GPUBatches(Xva, config["batch_size"], device, shuffle=False,
+                            Y=z_va)
+
+    return {
+        "train_loader": train_loader,
+        "val_loader": val_loader,
+        "X_val": Xva,
+        "type_val": np.asarray(types)[va],
+        "z_val": np.asarray(zred)[va].astype(float),
+        "z_mean": z_mean, "z_std": z_std,
+        "n_train": len(tr), "n_val": len(va), "n_test": len(te),
+        "x_shape": tuple(int(s) for s in X.shape), "bands": bands,
+    }
+
+
+# =========================================================================== #
+# 2. Modelo
+# =========================================================================== #
+class EncoderBranch(nn.Module):
+    """CNN que mapea un nivel (4,30,30) -> vector branch_dim. 30->15->8->4."""
+
+    def __init__(self, base_ch, branch_dim):
+        super().__init__()
+        c1, c2, c3 = base_ch, base_ch * 2, base_ch * 4
+        self.conv = nn.Sequential(
+            nn.Conv2d(N_BANDS, c1, 3, stride=2, padding=1),
+            nn.BatchNorm2d(c1), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(c1, c2, 3, stride=2, padding=1),
+            nn.BatchNorm2d(c2), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(c2, c3, 3, stride=2, padding=1),
+            nn.BatchNorm2d(c3), nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.flat_dim = c3 * 4 * 4
+        self.fc = nn.Linear(self.flat_dim, branch_dim)
+
+    def forward(self, x):
+        h = self.conv(x)
+        h = h.flatten(1)
+        return F.leaky_relu(self.fc(h), 0.2)
+
+
+class DecoderBranch(nn.Module):
+    """Simetrico al encoder: vector branch_dim -> (4,30,30).
+
+    Usa PixelShuffle (sub-pixel conv) en vez de upsample bilineal.
+    Espacial: 4 -> 8 -> 16 -> 32 (tres x2) y crop final centrado a 30.
+    """
+
+    def __init__(self, base_ch, branch_dim):
+        super().__init__()
+        c1, c2, c3 = base_ch, base_ch * 2, base_ch * 4
+        self.c3 = c3
+        self.fc = nn.Linear(branch_dim, c3 * 4 * 4)
+
+        def ps_block(cin, cout):
+            return nn.Sequential(
+                nn.Conv2d(cin, cout * 4, 3, padding=1), nn.PixelShuffle(2),
+                nn.BatchNorm2d(cout), nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(cout, cout, 3, padding=1),
+                nn.BatchNorm2d(cout), nn.LeakyReLU(0.2, inplace=True))
+
+        self.b1 = ps_block(c3, c2)
+        self.b2 = ps_block(c2, c1)
+        self.b3 = ps_block(c1, c1)
+        self.out = nn.Conv2d(c1, N_BANDS, 3, padding=1)
+
+    def forward(self, v):
+        h = F.leaky_relu(self.fc(v), 0.2).view(-1, self.c3, 4, 4)
+        h = self.b3(self.b2(self.b1(h)))
+        h = h[:, :, 1:31, 1:31]
+        return self.out(h)
+
+
+class MultiResVAE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.L = N_LEVELS
+        self.share = config["share_level_weights"]
+        bd, bch = config["branch_dim"], config["base_ch"]
+        zd = config["z_dim"]
+
+        n = 1 if self.share else self.L
+        self.enc_branches = nn.ModuleList([EncoderBranch(bch, bd) for _ in range(n)])
+        self.dec_branches = nn.ModuleList([DecoderBranch(bch, bd) for _ in range(n)])
+
+        self.enc_fuse = nn.Sequential(
+            nn.Linear(self.L * bd, config["fusion_dim"]),
+            nn.LeakyReLU(0.2, inplace=True))
+        self.fc_mu = nn.Linear(config["fusion_dim"], zd)
+        self.fc_logvar = nn.Linear(config["fusion_dim"], zd)
+
+        self.dec_fuse = nn.Sequential(
+            nn.Linear(zd, config["fusion_dim"]),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(config["fusion_dim"], self.L * bd),
+            nn.LeakyReLU(0.2, inplace=True))
+        self.branch_dim = bd
+
+        # regresor de redshift: MLP de una capa oculta sobre mu.
+        # 64 -> 128 -> 1, con LeakyReLU(0.2) consistente con el resto de la red.
+        # la salida es lineal (sin activacion) porque predice un escalar continuo.
+        self.regressor = nn.Sequential(
+            nn.Linear(zd, zd * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(zd * 2, 1),
+        )
+
+        self.apply(self._init_weights)
+        nn.init.zeros_(self.fc_logvar.weight)
+        nn.init.zeros_(self.fc_logvar.bias)
+
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            nn.init.kaiming_normal_(m.weight, a=0.2, nonlinearity="leaky_relu")
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def _enc(self, l):
+        return self.enc_branches[0 if self.share else l]
+
+    def _dec(self, l):
+        return self.dec_branches[0 if self.share else l]
+
+    def encode(self, x):
+        B = x.size(0)
+        if self.share:
+            h = x.reshape(B * self.L, N_BANDS, IMG, IMG)
+            h = self.enc_branches[0](h).view(B, self.L * self.branch_dim)
+        else:
+            h = torch.cat([self._enc(l)(x[:, l]) for l in range(self.L)], dim=1)
+        h = self.enc_fuse(h)
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def reparameterize(self, mu, logvar):
+        if not self.training:
+            return mu
+        std = torch.exp(0.5 * logvar)
+        return mu + torch.randn_like(std) * std
+
+    def decode(self, z):
+        B = z.size(0)
+        h = self.dec_fuse(z)
+        if self.share:
+            h = h.reshape(B * self.L, self.branch_dim)
+            out = self.dec_branches[0](h).view(B, self.L, N_BANDS, IMG, IMG)
+        else:
+            chunks = h.view(B, self.L, self.branch_dim)
+            outs = [self._dec(l)(chunks[:, l]) for l in range(self.L)]
+            out = torch.stack(outs, dim=1)
+        return out
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon = self.decode(z)
+        z_pred = self.regressor(mu).squeeze(-1)
+        return recon, mu, logvar, z_pred
+
+
+# =========================================================================== #
+# 3. Perdida
+# =========================================================================== #
+def vae_loss(recon, x, mu, logvar, beta):
+    recon_per_img = F.mse_loss(recon, x, reduction="none").sum(dim=[1, 2, 3, 4])
+    recon_term = recon_per_img.mean()
+    kl_per_img = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+    kl_term = kl_per_img.mean()
+    return recon_term + beta * kl_term, recon_term, kl_term
+
+
+def redshift_loss(z_pred, z_true):
+    return F.mse_loss(z_pred, z_true)
+
+
+def beta_schedule(epoch, config):
+    w = max(1, config["warmup_epochs"])
+    return config["beta_final"] * min(1.0, epoch / w)
+
+
+def kl_per_dim(mu, logvar):
+    return (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp())).mean(dim=0)
+
+
+# =========================================================================== #
+# 3b. Metricas de photo-z
+# =========================================================================== #
+def photoz_metrics(z_pred, z_true, eta_threshold=0.05):
+    dz = (z_pred - z_true) / (1.0 + z_true)
+    bias = float(np.median(dz))
+    sigma_mad = 1.4826 * float(np.median(np.abs(dz - np.median(dz))))
+    eta = float(np.mean(np.abs(dz) > eta_threshold)) * 100.0
+    rmse = float(np.sqrt(np.mean(dz ** 2)))
+    return {"bias": bias, "sigma_mad": sigma_mad, "eta": eta, "rmse": rmse}
+
+
+# =========================================================================== #
+# 4. Train / validate
+# =========================================================================== #
+def train_epoch(model, loader, opt, beta, alpha, device, grad_clip):
+    model.train()
+    tot = rec = kl_sum = reg = 0.0
+    n = 0
+    for x, z_true, _ in loader:
+        x = x.to(device)
+        opt.zero_grad()
+        recon, mu, logvar, z_pred = model(x)
+        loss_vae, r, k = vae_loss(recon, x, mu, logvar, beta)
+        loss_reg = redshift_loss(z_pred, z_true)
+        loss = loss_vae + alpha * loss_reg
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        opt.step()
+        bs = x.size(0)
+        tot += loss.item() * bs
+        rec += r.item() * bs
+        kl_sum += k.item() * bs
+        reg += loss_reg.item() * bs
+        n += bs
+    return {"total": tot / n, "recon": rec / n, "kl": kl_sum / n, "reg": reg / n}
+
+
+@torch.no_grad()
+def validate(model, loader, device, config, image_metrics=True):
+    model.eval()
+    beta_f = config["beta_final"]
+    alpha = config["alpha_redshift"]
+    tot = rec = kl_sum = mse_px = reg_sum = 0.0
+    n = 0
+    ssim_sum = psnr_sum = 0.0
+    kld_accum = torch.zeros(config["z_dim"], device=device)
+    all_zpred = []
+    all_ztrue = []
+
+    for x, z_true, _ in loader:
+        x = x.to(device)
+        recon, mu, logvar, z_pred = model(x)
+        loss_vae, r, k = vae_loss(recon, x, mu, logvar, beta_f)
+        loss_reg = redshift_loss(z_pred, z_true)
+        loss = loss_vae + alpha * loss_reg
+        bs = x.size(0)
+        tot += loss.item() * bs
+        rec += r.item() * bs
+        kl_sum += k.item() * bs
+        reg_sum += loss_reg.item() * bs
+        mse_px += F.mse_loss(recon, x, reduction="mean").item() * bs
+        kld_accum += kl_per_dim(mu, logvar) * bs
+        n += bs
+        all_zpred.append(z_pred.cpu().numpy())
+        all_ztrue.append(z_true.cpu().numpy())
+
+        if HAS_TM and image_metrics:
+            xr = x.reshape(-1, N_BANDS, IMG, IMG)
+            rr = recon.reshape(-1, N_BANDS, IMG, IMG)
+            dr = float(xr.max() - xr.min())
+            try:
+                ssim_sum += _ssim(rr, xr, data_range=dr).item() * bs
+                psnr_sum += _psnr(rr, xr, data_range=dr).item() * bs
+            except Exception:
+                pass
+
+    kld = (kld_accum / n).cpu().numpy()
+    active = int((kld > config["active_kl_thresh"]).sum())
+
+    z_mean, z_std = config["z_mean"], config["z_std"]
+    zpred_all = np.concatenate(all_zpred) * z_std + z_mean
+    ztrue_all = np.concatenate(all_ztrue) * z_std + z_mean
+    pz = photoz_metrics(zpred_all, ztrue_all, eta_threshold=config["eta_threshold"])
+
+    out = {"total": tot / n, "recon": rec / n, "kl": kl_sum / n, "reg": reg_sum / n,
+           "mse_px": mse_px / n, "kl_per_dim_mean": float(kld.mean()),
+           "active_dims": active, "kld_vec": kld,
+           "pz_bias": pz["bias"], "pz_sigma_mad": pz["sigma_mad"],
+           "pz_eta": pz["eta"], "pz_rmse": pz["rmse"]}
+    if HAS_TM and image_metrics:
+        out["ssim"] = ssim_sum / n
+        out["psnr"] = psnr_sum / n
+    return out
+
+
+# =========================================================================== #
+# 5. Visualizacion
+# =========================================================================== #
+def _to_display(arr4, mode, band):
+    def stretch(im):
+        lo, hi = np.percentile(im, [1, 99])
+        return np.clip((im - lo) / (hi - lo + 1e-8), 0, 1)
+    if mode == "rgb":
+        rgb = np.stack([stretch(arr4[2]), stretch(arr4[1]), stretch(arr4[0])], axis=-1)
+        return rgb
+    return stretch(arr4[band])
+
+
+def save_recon_grid(model, X_val, device, config, epoch, logger):
+    model.eval()
+    n = config["n_viz"]; lvl = config["viz_level"]
+    x = X_val[:n].to(device)
+    with torch.no_grad():
+        recon, _, _, _ = model(x)
+    x = x.cpu().numpy(); recon = recon.cpu().numpy()
+    cmap = None if config["viz_mode"] == "rgb" else "gray"
+
+    fig, axes = plt.subplots(2, n, figsize=(2 * n, 4.4))
+    for j in range(n):
+        axes[0, j].imshow(_to_display(x[j, lvl], config["viz_mode"], config["viz_band"]),
+                          origin="lower", cmap=cmap)
+        axes[1, j].imshow(_to_display(recon[j, lvl], config["viz_mode"], config["viz_band"]),
+                          origin="lower", cmap=cmap)
+        for r in (0, 1):
+            axes[r, j].set_xticks([]); axes[r, j].set_yticks([])
+    axes[0, 0].set_ylabel("input", fontsize=11)
+    axes[1, 0].set_ylabel("recon", fontsize=11)
+    fig.suptitle(f"Reconstruccion (nivel {lvl}, {config['viz_mode']}) - epoca {epoch}")
+    plt.tight_layout()
+    logger.save_fig(fig, f"recon_e{epoch:04d}.png", wandb_key="recon")
+
+
+def save_prior_samples(model, device, config, epoch, logger):
+    model.eval()
+    n = config["n_viz"]; lvl = config["viz_level"]
+    with torch.no_grad():
+        z = torch.randn(n, config["z_dim"], device=device)
+        samp = model.decode(z).cpu().numpy()
+    cmap = None if config["viz_mode"] == "rgb" else "gray"
+    fig, axes = plt.subplots(1, n, figsize=(2 * n, 2.4))
+    for j in range(n):
+        axes[j].imshow(_to_display(samp[j, lvl], config["viz_mode"], config["viz_band"]),
+                       origin="lower", cmap=cmap)
+        axes[j].set_xticks([]); axes[j].set_yticks([])
+    fig.suptitle(f"Samples del prior z~N(0,I) (nivel {lvl}) - epoca {epoch}")
+    plt.tight_layout()
+    logger.save_fig(fig, f"prior_e{epoch:04d}.png", wandb_key="prior_samples")
+
+
+@torch.no_grad()
+def latent_umap(model, data, device, config, epoch, logger):
+    model.eval()
+    X_val = data["X_val"]
+    mus = []
+    for i in range(0, X_val.size(0), config["batch_size"]):
+        mu, _ = model.encode(X_val[i:i + config["batch_size"]].to(device))
+        mus.append(mu.cpu().numpy())
+    mu = np.concatenate(mus, axis=0)
+
+    if HAS_UMAP:
+        emb = umap.UMAP(n_components=2, random_state=config["seed"]).fit_transform(mu)
+        method = "UMAP"
+    else:
+        from sklearn.decomposition import PCA
+        emb = PCA(n_components=2).fit_transform(mu)
+        method = "PCA (umap no instalado)"
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    types = data["type_val"].astype(str)
+    for t in np.unique(types):
+        m = types == t
+        axes[0].scatter(emb[m, 0], emb[m, 1], s=6, alpha=0.5, label=t)
+    axes[0].legend(markerscale=2, fontsize=9); axes[0].set_title("tipo morfologico")
+    sc = axes[1].scatter(emb[:, 0], emb[:, 1], s=6, alpha=0.6,
+                         c=data["z_val"], cmap="viridis")
+    plt.colorbar(sc, ax=axes[1], label="z (redshift)")
+    axes[1].set_title("redshift")
+    fig.suptitle(f"Espacio latente ({method}, mu) - epoca {epoch}")
+    plt.tight_layout()
+    logger.save_fig(fig, f"umap_e{epoch:04d}.png", wandb_key="latent_umap")
+
+
+@torch.no_grad()
+def save_photoz_scatter(model, data, device, config, epoch, logger):
+    """Scatter z_pred vs z_spec con rectas de errores catastroficos."""
+    model.eval()
+    X_val = data["X_val"]
+
+    preds = []
+    for i in range(0, X_val.size(0), config["batch_size"]):
+        batch = X_val[i:i + config["batch_size"]].to(device)
+        mu, _ = model.encode(batch)
+        zp = model.regressor(mu).squeeze(-1)
+        preds.append(zp.cpu().numpy())
+    z_pred = np.concatenate(preds) * config["z_std"] + config["z_mean"]
+    z_spec = data["z_val"]
+
+    eta_th = config["eta_threshold"]
+    pz = photoz_metrics(z_pred, z_spec, eta_threshold=eta_th)
+
+    z_min = min(z_spec.min(), z_pred.min()) - 0.02
+    z_max = max(z_spec.max(), z_pred.max()) + 0.02
+    z_line = np.linspace(z_min, z_max, 200)
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.scatter(z_spec, z_pred, s=4, alpha=0.4, c="#0072B2", rasterized=True)
+    ax.plot(z_line, z_line, color="black", linewidth=1.2, label="y = x")
+    upper = (1 + eta_th) * z_line + eta_th
+    lower = (1 - eta_th) * z_line - eta_th
+    ax.plot(z_line, upper, color="red", linewidth=2.0, linestyle="--",
+            label=rf"$|\Delta z|/(1+z) = {eta_th:g}$")
+    ax.plot(z_line, lower, color="red", linewidth=2.0, linestyle="--")
+
+    ax.set_xlabel(r"$z_{\rm spec}$", fontsize=13)
+    ax.set_ylabel(r"$z_{\rm pred}$", fontsize=13)
+    ax.set_xlim(z_min, z_max)
+    ax.set_ylim(z_min, z_max)
+    ax.set_aspect("equal")
+    ax.legend(loc="upper left", fontsize=10)
+
+    txt = (f"bias = {pz['bias']:.4f}\n"
+           f"$\\sigma_{{MAD}}$ = {pz['sigma_mad']:.4f}\n"
+           f"$\\eta$ = {pz['eta']:.2f}%\n"
+           f"RMSE = {pz['rmse']:.4f}")
+    ax.text(0.97, 0.03, txt, transform=ax.transAxes, fontsize=10,
+            verticalalignment="bottom", horizontalalignment="right",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85))
+
+    fig.suptitle(f"Photo-z (MLP sobre mu) - epoca {epoch}")
+    plt.tight_layout()
+    logger.save_fig(fig, f"photoz_e{epoch:04d}.png", wandb_key="photoz_scatter")
+
+
+# =========================================================================== #
+# 6. Logger
+# =========================================================================== #
+def resolve_run_id(config):
+    if config["run_id"] is not None:
+        return int(config["run_id"])
+    used = []
+    for p in Path(config["out_dir"]).glob("vae_summary*.json"):
+        m = re.search(r"vae_summary(\d+)\.json$", p.name)
+        if m:
+            used.append(int(m.group(1)))
+    return max(used) + 1 if used else 1
+
+
+class Logger:
+    def __init__(self, config):
+        self.config = config
+        rid = config["run_id"]
+        out = Path(config["out_dir"])
+        self.run_id = rid
+        self.fig_dir = out / "figures" / f"vae{rid}"
+        self.ckpt_dir = out / "checkpoints"
+        self.fig_dir.mkdir(parents=True, exist_ok=True)
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_path = out / f"vae_metrics{rid}.csv"
+        self.summary_path = out / f"vae_summary{rid}.json"
+        self.input_path = out / f"vae{rid}.input"
+        self.ckpt_path = self.ckpt_dir / f"vae_best{rid}.pt"
+        self.history = []
+        self.use_wandb = config["use_wandb"] and HAS_WANDB
+        if config["use_wandb"] and not HAS_WANDB:
+            print("[logger] use_wandb=True pero wandb no esta instalado -> solo local.")
+        if self.use_wandb:
+            wandb.init(project=config["wandb_project"], name=config["wandb_run"],
+                       config=config)
+
+    def write_input(self, config, data, model, device):
+        n_par = sum(p.numel() for p in model.parameters())
+        c1, c2, c3 = config["base_ch"], config["base_ch"] * 2, config["base_ch"] * 4
+        bd, fd, zd = config["branch_dim"], config["fusion_dim"], config["z_dim"]
+        shared = "compartida" if config["share_level_weights"] else "independiente"
+        try:
+            commit = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"], cwd=str(_REPO),
+                capture_output=True, text=True, timeout=5).stdout.strip() or "n/a"
+        except Exception:
+            commit = "n/a"
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        arch = (
+            f"[arquitectura]  multi-res VAE Siames (encoder {shared} entre los {N_LEVELS} niveles)\n"
+            f"  in ({N_LEVELS}x{N_BANDS}x{IMG}x{IMG})\n"
+            f"   |- EncoderBranch x{N_LEVELS} [{shared}]: Conv {IMG}->15->8->4, ch {c1}->{c2}->{c3}, fc -> {bd}\n"
+            f"        |- concat({N_LEVELS}x{bd}={N_LEVELS*bd}) -> fuse({fd}) -> mu/logvar  => z({zd})\n"
+            f"  z({zd}) -> dec_fuse({fd}) -> {N_LEVELS}x{bd}\n"
+            f"   |- DecoderBranch x{N_LEVELS} [{shared}]: fc->4x4({c3}), PixelShuffle 4->8->16->32,\n"
+            f"        crop->{IMG}, conv -> {N_BANDS} bandas  (salida lineal)\n"
+            f"  out ({N_LEVELS}x{N_BANDS}x{IMG}x{IMG})\n"
+            f"\n"
+            f"  [regresor de redshift]\n"
+            f"   mu({zd}) -> Linear({zd}, {zd*2}) -> LeakyReLU(0.2) -> Linear({zd*2}, 1) -> z_pred"
+        )
+
+        txt = f"""# vae{self.run_id}.input -- registro de reproducibilidad
+# generado: {ts}   |   run_id: {self.run_id}
+
+[datos]
+data_path     : {config['data_path']}
+X_shape       : {data['x_shape']}    # (N, niveles, bandas, H, W)
+bands         : {', '.join(data['bands'])}
+norm          : x/1000 -> sign(x)*(sqrt(sign(x)*x + 1) - 1)  ("otro", formula fija)
+split         : train/val/test = {data['n_train']}/{data['n_val']}/{data['n_test']}  (estratif. por tipo, seed {config['seed']})
+
+[latente]
+z_dim         : {zd}
+
+[hiperparametros]
+seed          : {config['seed']}
+base_ch       : {config['base_ch']}
+branch_dim    : {bd}
+fusion_dim    : {fd}
+share_levels  : {config['share_level_weights']}
+lr            : {config['lr']}
+batch_size    : {config['batch_size']}
+epochs        : {config['epochs']}   (early stopping patience={config['patience']})
+grad_clip     : {config['grad_clip']}
+
+[perdida]
+recon         : MSE gaussiana (suma por imagen)
+beta_inicial  : 0.0
+beta_final    : {config['beta_final']}
+warmup_epochs : {config['warmup_epochs']}
+alpha_redshift: {config['alpha_redshift']}
+z_norm        : z_score = (z - {config['z_mean']:.4f}) / {config['z_std']:.4f}  (media/std de train)
+
+[entorno]
+device        : {device.type}
+torch         : {torch.__version__}
+n_params      : {n_par/1e6:.2f}M
+git_commit    : {commit}
+
+{arch}
+"""
+        self.input_path.write_text(txt)
+        print(f"[logger] escrito {self.input_path}")
+
+    def log_scalars(self, epoch, d):
+        row = {"epoch": epoch, **d}
+        self.history.append(row)
+        import csv
+        with open(self.metrics_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(self.history[0].keys()))
+            w.writeheader(); w.writerows(self.history)
+        if self.use_wandb:
+            wandb.log({k: v for k, v in d.items()}, step=epoch)
+
+    def save_fig(self, fig, name, wandb_key=None):
+        path = self.fig_dir / name
+        fig.savefig(path, dpi=110, bbox_inches="tight")
+        if self.use_wandb and wandb_key:
+            wandb.log({wandb_key: wandb.Image(str(path))})
+        plt.close(fig)
+
+    def finish(self):
+        if self.use_wandb:
+            wandb.finish()
+
+
+# =========================================================================== #
+# 7. Loop principal
+# =========================================================================== #
+def main(config=CONFIG, epoch_callback=None):
+    set_seed(config["seed"])
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    print(f"device: {device} | seed: {config['seed']} | umap: {HAS_UMAP} | "
+          f"wandb: {HAS_WANDB} | torchmetrics: {HAS_TM}")
+    if device.type == "cpu":
+        print("[aviso] sin GPU (CUDA/MPS) -> corriendo en CPU (lento).")
+
+    data = load_data(config, device)
+    print(f"train={data['n_train']}  val={data['n_val']}")
+    config["z_mean"] = data["z_mean"]
+    config["z_std"] = data["z_std"]
+    print(f"redshift z-score: mean={config['z_mean']:.4f} std={config['z_std']:.4f}")
+
+    model = MultiResVAE(config).to(device)
+    n_par = sum(p.numel() for p in model.parameters())
+    print(f"modelo: {n_par/1e6:.2f}M params | share_level_weights={config['share_level_weights']}")
+
+    opt = torch.optim.Adam(model.parameters(), lr=config["lr"])
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode="min", factor=0.5, patience=config["sched_patience"])
+
+    config["run_id"] = resolve_run_id(config)
+    print(f"run_id: {config['run_id']}")
+    logger = Logger(config)
+    logger.write_input(config, data, model, device)
+
+    best_val = math.inf; best_epoch = -1; bad = 0
+    ckpt = logger.ckpt_path
+    alpha = config["alpha_redshift"]
+
+    for epoch in range(1, config["epochs"] + 1):
+        beta = beta_schedule(epoch, config)
+        tr = train_epoch(model, data["train_loader"], opt, beta, alpha, device,
+                         config["grad_clip"])
+        heavy = (epoch % config["metrics_every"] == 0)
+        val = validate(model, data["val_loader"], device, config, image_metrics=heavy)
+        sched.step(val["total"])
+        lr_now = opt.param_groups[0]["lr"]
+
+        logger.log_scalars(epoch, {
+            "loss/total_train": tr["total"], "loss/recon_train": tr["recon"],
+            "loss/kl_train": tr["kl"], "loss/reg_train": tr["reg"],
+            "loss/total_val": val["total"], "loss/recon_val": val["recon"],
+            "loss/kl_val": val["kl"], "loss/reg_val": val["reg"],
+            "val/mse_px": val["mse_px"],
+            "val/ssim": val.get("ssim", float("nan")),
+            "val/psnr": val.get("psnr", float("nan")),
+            "val/active_dims": val["active_dims"],
+            "val/kl_per_dim_mean": val["kl_per_dim_mean"],
+            "pz/bias": val["pz_bias"], "pz/sigma_mad": val["pz_sigma_mad"],
+            "pz/eta": val["pz_eta"], "pz/rmse": val["pz_rmse"],
+            "beta": beta, "lr": lr_now,
+        })
+        print(f"e{epoch:03d} | beta={beta:.3f} | "
+              f"train tot={tr['total']:.1f} rec={tr['recon']:.1f} kl={tr['kl']:.1f} reg={tr['reg']:.4f} | "
+              f"val tot={val['total']:.1f} rec={val['recon']:.1f} kl={val['kl']:.1f} reg={val['reg']:.4f} | "
+              f"act={val['active_dims']}/{config['z_dim']} "
+              f"ssim={val.get('ssim', float('nan')):.3f} "
+              f"eta={val['pz_eta']:.1f}%")
+
+        if epoch % config["fig_every"] == 0:
+            save_recon_grid(model, data["X_val"], device, config, epoch, logger)
+            save_prior_samples(model, device, config, epoch, logger)
+            save_photoz_scatter(model, data, device, config, epoch, logger)
+
+        if epoch_callback is not None:
+            epoch_callback(epoch, logger.history, model, data, device, config)
+
+        if val["total"] < best_val - 1e-4:
+            best_val = val["total"]; best_epoch = epoch; bad = 0
+            torch.save({"model": model.state_dict(), "config": config,
+                        "epoch": epoch, "val": val["total"]}, ckpt)
+        else:
+            bad += 1
+            if bad >= config["patience"]:
+                print(f"early stopping en epoca {epoch} (mejor={best_epoch})")
+                break
+
+    print(f"mejor val={best_val:.2f} (epoca {best_epoch}); cargando checkpoint")
+    model.load_state_dict(torch.load(ckpt, map_location=device)["model"])
+    save_recon_grid(model, data["X_val"], device, config, best_epoch, logger)
+    save_prior_samples(model, device, config, best_epoch, logger)
+    latent_umap(model, data, device, config, best_epoch, logger)
+    save_photoz_scatter(model, data, device, config, best_epoch, logger)
+
+    final = validate(model, data["val_loader"], device, config)
+    summary = {"run_id": config["run_id"],
+               "best_epoch": best_epoch, "best_val_total": best_val,
+               "final_recon_val": final["recon"], "final_kl_val": final["kl"],
+               "final_reg_val": final["reg"],
+               "final_mse_px": final["mse_px"], "final_active_dims": final["active_dims"],
+               "final_ssim": final.get("ssim"), "final_psnr": final.get("psnr"),
+               "final_pz_bias": final["pz_bias"], "final_pz_sigma_mad": final["pz_sigma_mad"],
+               "final_pz_eta": final["pz_eta"], "final_pz_rmse": final["pz_rmse"],
+               "z_dim": config["z_dim"],
+               "alpha_redshift": config["alpha_redshift"],
+               "z_mean": config["z_mean"], "z_std": config["z_std"],
+               "out_files": {
+                   "metrics":    logger.metrics_path.name,
+                   "input":      logger.input_path.name,
+                   "figures":    f"figures/vae{config['run_id']}/",
+                   "checkpoint": f"checkpoints/{logger.ckpt_path.name}",
+               }}
+    logger.summary_path.write_text(json.dumps(summary, indent=2))
+    print("resumen:", json.dumps(summary, indent=2))
+    logger.finish()
+    return model
+
+
+# =========================================================================== #
+# 8. Barrido (sweep)
+# =========================================================================== #
+_SWEEP_ALIASES = {
+    "z_dim": "z_dim", "zdim": "z_dim",
+    "beta": "beta_final", "beta_final": "beta_final",
+    "alpha": "alpha_redshift", "alpha_redshift": "alpha_redshift",
+    "warmup_epochs": "warmup_epochs", "warmup": "warmup_epochs",
+    "batch_size": "batch_size", "batchsize": "batch_size", "batch": "batch_size",
+    "base_ch": "base_ch",
+    "branch_dim": "branch_dim", "fusion_dim": "fusion_dim",
+    "lr": "lr", "epochs": "epochs", "seed": "seed",
+    "share_levels": "share_level_weights", "share": "share_level_weights",
+    "share_level_weights": "share_level_weights",
+    "grad_clip": "grad_clip", "patience": "patience", "warmup_ep": "warmup_epochs",
+    "run_id": "run_id",
+}
+_SWEEP_INT = {"z_dim", "warmup_epochs", "batch_size", "base_ch", "branch_dim",
+              "fusion_dim", "epochs", "seed", "patience", "run_id"}
+_SWEEP_FLOAT = {"beta_final", "lr", "grad_clip", "alpha_redshift"}
+_SWEEP_BOOL = {"share_level_weights"}
+
+
+def _coerce_param(key, val):
+    if key in _SWEEP_BOOL:
+        return str(val).lower() in ("1", "true", "yes", "y", "t")
+    if key in _SWEEP_INT:
+        return int(float(val))
+    if key in _SWEEP_FLOAT:
+        return float(val)
+    return val
+
+
+def parse_sweep_file(path):
+    header, rows = None, []
+    for ln in Path(path).read_text().splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            if header is None:
+                header = s.lstrip("#").split()
+            continue
+        rows.append(s.split())
+    if header is None:
+        raise ValueError(f"{path}: falta el header '# z_dim beta ...' en la 1ra linea.")
+    keys = []
+    for h in header:
+        k = _SWEEP_ALIASES.get(h.lower())
+        if k is None:
+            raise ValueError(
+                f"{path}: columna '{h}' no reconocida. "
+                f"Validas: {sorted(set(_SWEEP_ALIASES))}")
+        keys.append(k)
+    configs = []
+    for i, vals in enumerate(rows, 1):
+        if len(vals) != len(keys):
+            raise ValueError(
+                f"{path}: fila {i} tiene {len(vals)} valores pero el header "
+                f"define {len(keys)} columnas.")
+        configs.append({k: _coerce_param(k, v) for k, v in zip(keys, vals)})
+    return configs
+
+
+def run_sweep(path, base_config):
+    overrides = parse_sweep_file(path)
+    print(f"[sweep] {len(overrides)} configuraciones desde {path}")
+    ok, fail = 0, 0
+    for i, ov in enumerate(overrides, 1):
+        cfg = dict(base_config)
+        cfg.update(ov)
+        cfg["run_id"] = ov.get("run_id")
+        print("\n" + "=" * 72)
+        print(f"[sweep] corrida {i}/{len(overrides)}  overrides={ov}")
+        print("=" * 72)
+        try:
+            main(cfg)
+            ok += 1
+        except Exception as e:
+            import traceback
+            fail += 1
+            print(f"[sweep] corrida {i} FALLO: {e}")
+            traceback.print_exc()
+    print(f"\n[sweep] barrido completo: {ok} ok, {fail} con error.")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="VAE multi-resolucion + MLP redshift")
+    ap.add_argument("--data", help="ruta al vae_input.npz")
+    ap.add_argument("--out-dir", help="carpeta de salida")
+    ap.add_argument("--epochs", type=int)
+    ap.add_argument("--z-dim", type=int)
+    ap.add_argument("--beta-final", type=float)
+    ap.add_argument("--alpha-redshift", type=float)
+    ap.add_argument("--batch-size", type=int)
+    ap.add_argument("--lr", type=float)
+    ap.add_argument("--seed", type=int)
+    ap.add_argument("--run-id", type=int)
+    ap.add_argument("--wandb", action="store_true")
+    ap.add_argument("--no-share", action="store_true")
+    ap.add_argument("--sweep", nargs="?", const=str(_REPO / "scripts" / "parameters_vae.dat"))
+    args = ap.parse_args()
+
+    cfg = dict(CONFIG)
+    if args.data:        cfg["data_path"] = args.data
+    if args.out_dir:     cfg["out_dir"] = args.out_dir
+    if args.epochs:      cfg["epochs"] = args.epochs
+    if args.z_dim:       cfg["z_dim"] = args.z_dim
+    if args.beta_final is not None: cfg["beta_final"] = args.beta_final
+    if args.alpha_redshift is not None: cfg["alpha_redshift"] = args.alpha_redshift
+    if args.batch_size:  cfg["batch_size"] = args.batch_size
+    if args.lr:          cfg["lr"] = args.lr
+    if args.seed is not None: cfg["seed"] = args.seed
+    if args.run_id is not None: cfg["run_id"] = args.run_id
+    if args.wandb:       cfg["use_wandb"] = True
+    if args.no_share:    cfg["share_level_weights"] = False
+
+    if args.sweep:
+        run_sweep(args.sweep, cfg)
+    else:
+        main(cfg)
