@@ -1,0 +1,22 @@
+{
+  "run_id": 4,
+  "best_epoch": 36,
+  "best_val_total": 8934.244426985433,
+  "final_recon_val": 8739.470974800282,
+  "final_kl_val": 173.267447105924,
+  "final_z_val": 0.21506114360085107,
+  "final_z_rmse": 0.4637468457221985,
+  "final_z_corr": 0.8858455635306349,
+  "final_mse_px": 0.4855261669123083,
+  "final_active_dims": 63,
+  "final_ssim": null,
+  "final_psnr": null,
+  "z_dim": 64,
+  "z_sup_dim": 1,
+  "out_files": {
+    "metrics": "semi_superv_vae_metrics4.csv",
+    "input": "semi_superv_vae4.input",
+    "figures": "figures/semi_superv_vae4/",
+    "checkpoint": "checkpoints/semi_superv_vae_best4.pt"
+  }
+}

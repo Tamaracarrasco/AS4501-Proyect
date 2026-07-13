@@ -1,0 +1,52 @@
+# semi_superv_vae1.input - reproducibility record
+# generated: 2026-07-11 01:41:03 | run_id: 1
+
+[data]
+data_path     : /home/nacho/Projects/AS4501-Proyect/file_out_data/vae_input.npz
+X_shape       : (21285, 5, 4, 30, 30)    # (N, levels, bands, H, W)
+bands         : g, r, i, z
+norm          : arcsinh(flux/sigma_bg) + zscore per channel (fit only on train)
+z_target      : normalized using train mean/std
+z_mean        : 0.550021
+z_std         : 0.394276
+split         : train/val/test = 17028/2128/2129  (stratified by type, seed 42)
+
+[latent]
+z_dim         : 64
+z_sup_dim     : 1
+z_vae_dim     : 63
+
+[hyperparameters]
+seed          : 42
+base_ch       : 64
+branch_dim    : 128
+fusion_dim    : 256
+share_levels  : True
+lr            : 0.001
+batch_size    : 128
+epochs        : 200   (early stopping patience=25)
+grad_clip     : 5.0
+
+[loss]
+recon         : MSE gaussian (sum per image)
+kl            : only on z_vae
+z_reg         : MSE on z_sup vs normalized redshift
+beta_final    : 1.0
+warmup_epochs : 30
+z_reg_weight  : 1.0
+
+[environment]
+device        : cuda
+torch         : 2.12.1+cu132
+n_params      : 3.65M
+git_commit    : 77c9144
+
+[arquitectura] semi-supervised multi-res VAE (encoder compartida entre 5 niveles)
+  in (5x4x30x30)
+   |- EncoderBranch x5 [compartida]: Conv 30->15->8->4, ch 64->128->256, fc -> 128
+        |- concat(5x128=640) -> fuse(256)
+        |- heads: mu_vae(63), logvar_vae(63), z_sup(1)
+  [latent split] z = [z_sup | z_vae] with z_sup supervised by redshift
+  z(64) -> dec_fuse(256) -> 5x128
+   |- DecoderBranch x5 [compartida]: fc->4x4(256), PixelShuffle 4->8->16->32, crop->30, conv -> 4 bandas
+  out (5x4x30x30)
