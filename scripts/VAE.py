@@ -4,7 +4,8 @@ VAE convolucional multi-resolución para stamps
 Input (producido por preprocess_vae.py):  X de shape (N, 5, 4, 30, 30)
     eje 1 -> 5 niveles de resolución (ramas)
     eje 2 -> 4 bandas g,r,i,z (canales de cada rama)
-    datos ya normalizados: arcsinh(flux/sigma_bg) + z-score por canal.
+    datos ya normalizados con "otro" (compresión de rango dinámico con signo):
+        x = pixel/1000; x_escalado = sign(x)*(sqrt(sign(x)*x + 1) - 1)
 
 Arquitectura tentativa:
     - 5 ramas, una por nivel de resolución. CADA RAMA COMPARTE LOS PESOS
@@ -19,9 +20,9 @@ Arquitectura tentativa:
       compartida (PixelShuffle) -> reconstrucción (N,5,4,30,30).
 
 Decisiones de diseño no obvias (ver también comentarios inline):
-    - Salida del decoder LINEAL (identidad): los datos están z-scoreados
-      (no acotados, ~gaussianos) -> verosimilitud gaussiana -> pérdida MSE.
-      (Si fueran [0,1] se usaría sigmoide + BCE.)
+    - Salida del decoder LINEAL (identidad): los datos están normalizados con
+      "otro" (signed sqrt, no acotados, aprox. simétricos) -> verosimilitud
+      gaussiana -> pérdida MSE. (Si fueran [0,1] se usaría sigmoide + BCE.)
     - Recon = SUMA por imagen (no media) para que su escala sea comparable a la
       KL (que también es suma sobre dims latentes). Si se promediara por píxel,
       la KL aplastaría todo y habría posterior collapse.
@@ -283,7 +284,7 @@ class DecoderBranch(nn.Module):
         self.b1 = ps_block(c3, c2)                        # 4  -> 8
         self.b2 = ps_block(c2, c1)                        # 8  -> 16
         self.b3 = ps_block(c1, c1)                        # 16 -> 32
-        # última conv -> 4 bandas, SIN activación (salida lineal, datos z-scoreados)
+        # última conv -> 4 bandas, SIN activación (salida lineal, datos normalizados "otro")
         self.out = nn.Conv2d(c1, N_BANDS, 3, padding=1)
 
     def forward(self, v):
@@ -619,7 +620,7 @@ class Logger:
             f"        |- concat({N_LEVELS}x{bd}={N_LEVELS*bd}) -> fuse({fd}) -> mu/logvar  => z({zd})\n"
             f"  z({zd}) -> dec_fuse({fd}) -> {N_LEVELS}x{bd}\n"
             f"   |- DecoderBranch x{N_LEVELS} [{shared}]: fc->4x4({c3}), PixelShuffle 4->8->16->32,\n"
-            f"        crop->{IMG}, conv -> {N_BANDS} bandas  (salida lineal, z-score)\n"
+            f"        crop->{IMG}, conv -> {N_BANDS} bandas  (salida lineal, norm \"otro\")\n"
             f"  out ({N_LEVELS}x{N_BANDS}x{IMG}x{IMG})"
         )
 
@@ -630,7 +631,7 @@ class Logger:
 data_path     : {config['data_path']}
 X_shape       : {data['x_shape']}    # (N, niveles, bandas, H, W)
 bands         : {', '.join(data['bands'])}
-norm          : arcsinh(flux/sigma_bg) + zscore por canal (fit solo en train)
+norm          : "otro" (signed sqrt): x/1000 -> sign(x)*(sqrt(sign(x)*x+1)-1), fórmula fija sin ajuste en train
 split         : train/val/test = {data['n_train']}/{data['n_val']}/{data['n_test']}  (estratif. por tipo, seed {config['seed']})
 
 [latente]
