@@ -7,7 +7,7 @@ Decisiones acordadas para el VAE:
     profundidad (magnitud corregida por extinción) y SNR>=3 en todas las bandas,
     más eliminación de stamps con píxeles NaN.
   - Normalización de intensidad ("otro"): compresión de rango dinámico con
-    signo, aplicada POR CANAL (canal = banda x nivel):
+    signo, aplicada a todo el tensor:
         x = pixel / 1000
         x_escalado = sign(x) * (sqrt(sign(x)*x + 1) - 1)
     Es una fórmula fija (no ajusta parámetros con el train), por lo que se

@@ -142,6 +142,11 @@ CONFIG = {
     "viz_mode":     "rgb",     # "rgb" (g/r/i) o "band"
     "viz_band":     1,         # banda si viz_mode="band" (1 = r)
     "n_viz":        8,         # nº de ejemplos en las grillas
+    # UMAP no tiene "min_pts" (eso es de HDBSCAN/DBSCAN); sus dos hiperparámetros
+    # son n_neighbors y min_dist -> grilla de sensibilidad sobre ambos, solo en
+    # la mejor época (al cierre, junto con el UMAP simple; es lo más caro de la viz).
+    "umap_n_neighbors_grid": [10, 30, 50],
+    "umap_min_dist_grid":    [0.0, 0.25, 0.5],
 
     # wandb (off por defecto; artefactos locales siempre se guardan)
     "use_wandb":     False,
@@ -569,6 +574,74 @@ def latent_umap(model, data, device, config, epoch, logger):
     logger.save_fig(fig, f"umap_e{epoch:04d}.png", wandb_key="latent_umap")
 
 
+def plot_loss_curves(logger, epoch):
+    """Curvas de loss de reconstrucción y KL (train vs val) a lo largo de las épocas."""
+    hist = logger.history
+    if not hist:
+        return
+    epochs = [h["epoch"] for h in hist]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    axes[0].plot(epochs, [h["loss/recon_train"] for h in hist], label="train")
+    axes[0].plot(epochs, [h["loss/recon_val"] for h in hist], label="val")
+    axes[0].set_xlabel("época"); axes[0].set_ylabel("recon (MSE sumada/img)")
+    axes[0].set_title("Reconstrucción"); axes[0].legend()
+
+    axes[1].plot(epochs, [h["loss/kl_train"] for h in hist], label="train")
+    axes[1].plot(epochs, [h["loss/kl_val"] for h in hist], label="val")
+    axes[1].set_xlabel("época"); axes[1].set_ylabel("KL")
+    axes[1].set_title("KL"); axes[1].legend()
+
+    fig.suptitle(f"Curvas de loss — época {epoch}")
+    plt.tight_layout()
+    logger.save_fig(fig, f"loss_curves_e{epoch:04d}.png", wandb_key="loss_curves")
+
+
+@torch.no_grad()
+def latent_umap_grid(model, data, device, config, epoch, logger):
+    """Grilla de proyecciones UMAP variando n_neighbors x min_dist.
+
+    n_neighbors controla el balance local/global (bajo = estructura fina,
+    alto = estructura global) y min_dist controla qué tan apretados quedan los
+    puntos en el embedding (bajo = clusters compactos, alto = más disperso).
+    Sirve para chequear que la separación del espacio latente (por tipo o
+    redshift) no sea un artefacto de una elección particular de hiperparámetros.
+    Requiere `umap-learn`; si no está instalado se omite (no hay equivalente
+    razonable en PCA, que no tiene estos hiperparámetros).
+    """
+    if not HAS_UMAP:
+        print("[latent_umap_grid] umap no instalado -> se omite la grilla.")
+        return
+    model.eval()
+    X_val = data["X_val"]
+    mus = []
+    for i in range(0, X_val.size(0), config["batch_size"]):
+        mu, _ = model.encode(X_val[i:i + config["batch_size"]].to(device))
+        mus.append(mu.cpu().numpy())
+    mu = np.concatenate(mus, axis=0)
+    z_val = data["z_val"]
+
+    nn_grid = config["umap_n_neighbors_grid"]
+    md_grid = config["umap_min_dist_grid"]
+    n_rows, n_cols = len(nn_grid), len(md_grid)
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.4 * n_cols, 3.4 * n_rows),
+                              squeeze=False)
+    sc = None
+    for i, nn_ in enumerate(nn_grid):
+        for j, md in enumerate(md_grid):
+            emb = umap.UMAP(n_components=2, n_neighbors=nn_, min_dist=md,
+                             random_state=config["seed"]).fit_transform(mu)
+            ax = axes[i, j]
+            sc = ax.scatter(emb[:, 0], emb[:, 1], s=4, alpha=0.6,
+                             c=z_val, cmap="viridis")
+            ax.set_title(f"n_neighbors={nn_}, min_dist={md}", fontsize=9)
+            ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle(f"Sensibilidad UMAP (coloreado por z) — época {epoch}")
+    fig.colorbar(sc, ax=axes, shrink=0.5, label="z (redshift)")
+    logger.save_fig(fig, f"umap_grid_e{epoch:04d}.png", wandb_key="latent_umap_grid")
+
+
 # =========================================================================== #
 # 6. Logger  (local siempre; wandb opcional detrás de flag)
 # =========================================================================== #
@@ -767,11 +840,12 @@ def main(config=CONFIG, epoch_callback=None):
               f"act={val['active_dims']}/{config['z_dim']} "
               f"ssim={val.get('ssim', float('nan')):.3f}")
 
-        # visualizaciones periódicas: recon + prior + umap cada fig_every épocas
+        # visualizaciones periódicas: recon + prior + curvas de loss cada fig_every épocas
         if epoch % config["fig_every"] == 0:
             save_recon_grid(model, data["X_val"], device, config, epoch, logger)
             save_prior_samples(model, device, config, epoch, logger)
-            # UMAP solo en la mejor época (al cierre); es lo más caro de la viz.
+            plot_loss_curves(logger, epoch)
+            # UMAP (simple y grilla) solo en la mejor época (al cierre); es lo más caro de la viz.
 
         # hook de monitoreo en vivo (notebook). Va después de guardar las figuras
         # para que el callback pueda mostrar las PNG recién generadas.
@@ -794,7 +868,9 @@ def main(config=CONFIG, epoch_callback=None):
     model.load_state_dict(torch.load(ckpt, map_location=device)["model"])
     save_recon_grid(model, data["X_val"], device, config, best_epoch, logger)
     save_prior_samples(model, device, config, best_epoch, logger)
+    plot_loss_curves(logger, best_epoch)
     latent_umap(model, data, device, config, best_epoch, logger)
+    latent_umap_grid(model, data, device, config, best_epoch, logger)
 
     # resumen final
     final = validate(model, data["val_loader"], device, config)
