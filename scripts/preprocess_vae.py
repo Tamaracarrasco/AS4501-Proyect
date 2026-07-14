@@ -235,66 +235,40 @@ def split_ids(n, stratify=None, fracs=SPLIT_FRACS, seed=RANDOM_SEED):
 
 
 # --------------------------------------------------------------------------- #
-# 6. Normalización: arcsinh + z-score con escala compartida por nivel
+# 6. Normalización: División por el máximo por objeto (con zero-clipping)
 # --------------------------------------------------------------------------- #
-def fit_norm(X, train_idx, max_stamps=2000, seed=RANDOM_SEED):
-    """Estima, por nivel, el softening del arcsinh y mu/std compartidos.
-
-    softening[l] = sigma_bg robusta (sigma-clipped), estimada juntando las 4
-                   bandas del nivel l sobre un pool de píxeles de train. Esto
-                   fuerza una escala común entre bandas dentro de cada nivel.
-    mu/std[l]    = media/desv. de t = arcsinh(flux/softening) en train, usando
-                   el mismo softening para las 4 bandas del nivel.
-
-    Devuelve dict con arrays de shape (5,).
+def fit_norm(X, train_idx, max_stamps=None, seed=None):
     """
-    rng = np.random.default_rng(seed)
-    n = len(train_idx)
-    sub_pos = rng.choice(n, size=min(max_stamps, n), replace=False)
-    sub_idx = np.asarray(train_idx)[sub_pos]
-
-    soft = np.zeros(N_LEVELS, dtype=np.float64)
-    mu = np.zeros_like(soft)
-    std = np.zeros_like(soft)
-
-    for l in range(N_LEVELS):
-        px = X[sub_idx, l].ravel()
-        # sigma-clipping: aísla el fondo descartando píxeles de la galaxia.
-        _, _, sigma_bg = sigma_clipped_stats(px, sigma=3, maxiters=5)
-        sigma_bg = float(sigma_bg) if sigma_bg > 0 else 1e-3
-        soft[l] = sigma_bg
-
-        count = 0
-        total = 0.0
-        total_sq = 0.0
-        for start in range(0, n, 256):
-            batch_idx = train_idx[start:start + 256]
-            chunk = np.arcsinh(X[batch_idx, l] / sigma_bg)
-            chunk64 = chunk.astype(np.float64, copy=False)
-            total += chunk64.sum()
-            total_sq += np.square(chunk64).sum()
-            count += chunk64.size
-        mu[l] = total / count
-        variance = total_sq / count - mu[l] ** 2
-        std[l] = np.sqrt(variance) if variance > 0 else 1.0
-
-    return {"softening": soft, "mu": mu, "std": std}
-
+    Como la normalización ahora es estrictamente local (por objeto),
+    no necesitamos estimar estadísticas globales sobre el set de entrenamiento.
+    Retornamos un diccionario informativo para el archivo de configuración.
+    """
+    return {"method": "per_object_max", "clipped_at_zero": True}
 
 def apply_norm(X, norm):
-    """arcsinh(flux/softening) y luego z-score, con escala compartida por nivel.
-
-    Se aplica in-place para evitar otra copia completa del tensor.
+    """
+    1. Recorta los valores negativos (fondo) a 0.
+    2. Encuentra el píxel máximo absoluto de cada objeto (considerando sus 5 niveles y 4 bandas).
+    3. Divide todo el objeto por ese máximo, mapeándolo al rango [0, 1].
+    
+    Se aplica in-place para ahorrar RAM.
     """
     X = np.asarray(X, dtype=np.float32)
-    soft = norm["softening"]
-    mu = norm["mu"]
-    std = norm["std"]
-    for l in range(N_LEVELS):
-        np.divide(X[:, l], soft[l], out=X[:, l])
-        np.arcsinh(X[:, l], out=X[:, l])
-        X[:, l] -= mu[l]
-        X[:, l] /= std[l]
+    
+    # 1. Clipping inferior en 0 (in-place)
+    np.clip(X, a_min=0, a_max=None, out=X)
+    
+    # 2. Calcular el máximo por objeto.
+    # X shape: (N, 5, 4, 30, 30) -> Ejes a reducir: 1, 2, 3, 4
+    # keepdims=True preserva la forma (N, 1, 1, 1, 1) para hacer broadcasting directo.
+    max_vals = X.max(axis=(1, 2, 3, 4), keepdims=True)
+    
+    # Prevenir divisiones por cero (en el caso extremo de un stamp puramente vacío)
+    max_vals[max_vals == 0] = 1e-8
+    
+    # 3. División in-place
+    np.divide(X, max_vals, out=X)
+    
     return X.astype(np.float32, copy=False)
 
 
@@ -346,16 +320,19 @@ def main(n_max=None, out_name="vae_input.npz", tar_path=None, features_path=None
         type=df_al["type"].to_numpy(),
         z=df_al["z"].to_numpy(),
         idx_train=tr, idx_val=va, idx_test=te,
-        softening=norm["softening"], mu=norm["mu"], std=norm["std"],
+        # Guardamos la nueva metadata de normalización en lugar de las variables antiguas
+        norm_method=norm["method"], 
+        clipped_at_zero=norm["clipped_at_zero"],
         bands=np.array(BANDS),
     )
+    
     # Config legible aparte.
     (OUT_DIR / "vae_input_config.json").write_text(json.dumps({
         "shape": list(Xn.shape),
         "axes": "(N, nivel[5], banda[4], 30, 30)",
         "bands": BANDS,
         "depth_cut": DEPTH_CUT, "snr_min": SNR_MIN,
-        "norm": "arcsinh(flux/sigma_bg) + zscore con escala compartida por nivel (estimado en train)",
+        "norm": "división por el máximo del objeto (con zero-clipping previo)",
         "split_fracs": SPLIT_FRACS, "seed": RANDOM_SEED,
     }, indent=2))
     print(f"\nGuardado: {out}")

@@ -1,0 +1,18 @@
+{
+  "run_id": 3,
+  "best_epoch": 18,
+  "best_val_total": 6.429029324897249,
+  "final_recon_val": 5.285020039493876,
+  "final_kl_val": 20.808174176323682,
+  "final_mse_px": 0.0002936122368292925,
+  "final_active_dims": 64,
+  "final_ssim": null,
+  "final_psnr": null,
+  "z_dim": 64,
+  "out_files": {
+    "metrics": "vae_metrics3.csv",
+    "input": "vae3.input",
+    "figures": "figures/vae3/",
+    "checkpoint": "checkpoints/vae_best3.pt"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "shape": [
+    21285,
+    5,
+    4,
+    30,
+    30
+  ],
+  "axes": "(N, nivel[5], banda[4], 30, 30)",
+  "bands": [
+    "g",
+    "r",
+    "i",
+    "z"
+  ],
+  "depth_cut": {
+    "g": 24.0,
+    "r": 23.4,
+    "i": 23.3,
+    "z": 22.5
+  },
+  "snr_min": 3.0,
+  "norm": "divisi\u00f3n por el m\u00e1ximo del objeto (con zero-clipping previo)",
+  "split_fracs": [
+    0.8,
+    0.1,
+    0.1
+  ],
+  "seed": 42
+}

@@ -1,0 +1,44 @@
+# vae3.input — registro de reproducibilidad
+# generado: 2026-07-13 20:15:51   |   run_id: 3
+
+[datos]
+data_path     : /home/nacho/Projects/AS4501-Proyect/file_out_data/vae_input.npz
+X_shape       : (21285, 5, 4, 30, 30)    # (N, niveles, bandas, H, W)
+bands         : g, r, i, z
+norm          : arcsinh(flux/sigma_bg) + zscore por canal (fit solo en train)
+split         : train/val/test = 17028/2128/2129  (estratif. por tipo, seed 42)
+
+[latente]
+z_dim         : 64
+
+[hiperparametros]
+seed          : 42
+base_ch       : 64
+branch_dim    : 128
+fusion_dim    : 256
+share_levels  : True
+lr            : 0.001
+batch_size    : 128
+epochs        : 20   (early stopping patience=25)
+grad_clip     : 5.0
+
+[perdida]
+recon         : MSE gaussiana (suma por imagen)
+beta_inicial  : 0.0
+beta_final    : 0.05
+warmup_epochs : 30        # beta sube 0.0 -> 0.05 lineal en 30 epocas
+
+[entorno]
+device        : cuda
+torch         : 2.12.1+cu132
+n_params      : 3.65M
+git_commit    : a758d01
+
+[arquitectura]  multi-res VAE Siames (encoder compartida entre los 5 niveles)
+  in (5x4x30x30)
+   |- EncoderBranch x5 [compartida]: Conv 30->15->8->4, ch 64->128->256, fc -> 128
+        |- concat(5x128=640) -> fuse(256) -> mu/logvar  => z(64)
+  z(64) -> dec_fuse(256) -> 5x128
+   |- DecoderBranch x5 [compartida]: fc->4x4(256), PixelShuffle 4->8->16->32,
+        crop->30, conv -> 4 bandas  (salida lineal, z-score)
+  out (5x4x30x30)

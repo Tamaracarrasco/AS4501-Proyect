@@ -56,6 +56,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+from alembic import config
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
@@ -123,6 +124,11 @@ CONFIG = {
     "sched_patience": 8,       # ReduceLROnPlateau
     "num_workers":  2,
     "seed":         42,
+    "data_augmentation": False, 
+
+    "lr_enc":       5e-4,      # LR del Encoder (más bajo para evitar colapso temprano)
+    "lr_dec":       2e-3,      # LR del Decoder (más alto para que aprenda a leer el latente rápido)
+    "free_bits":    0.1,       # Umbral lambda para KL por dimensión (0.0 = desactivado)
 
     # visualización / monitoreo
     "fig_every":    50,        # guarda recon + prior + umap cada N épocas
@@ -227,6 +233,22 @@ def load_data(config, device):
         "x_shape": tuple(int(s) for s in X.shape), "bands": bands,
     }
 
+def data_augmentation(x):
+    """Aplicamos rotaciones en múltiplos de 90 grados y reflexiones aleatorias a un batch de tensores"""
+
+    # Número de rotaciones (0, 1, 2, 3) que corresponden a 0°, 90°, 180° y 270°
+    k = torch.randint(0, 4, (x.size(0),), device=x.device)
+
+    # Aplicamos la rotación a cada imagen en el batch
+    x_rot = torch.stack([torch.rot90(x[i], int(k[i]), dims=[-2, -1]) for i in range(x.size(0))])
+
+    # Asignamos una probabilidad de 0.5 para reflejar horizontalmente
+    flip_idx = torch.rand(x.size(0), device=x.device) < 0.5
+
+    if flip_idx.any():
+        x_rot[flip_idx] = torch.flip(x_rot[flip_idx], dims=[-1])  # Reflejo horizontal
+    
+    return x_rot
 
 # =========================================================================== #
 # 2. Modelo
@@ -374,7 +396,7 @@ class MultiResVAE(nn.Module):
 # =========================================================================== #
 # 3. Pérdida
 # =========================================================================== #
-def vae_loss(recon, x, mu, logvar, beta):
+def vae_loss(recon, x, mu, logvar, beta, free_bits=0.0):
     """Devuelve (total, recon, kl) — recon y kl SEPARADOS.
 
     recon : MSE SUMADA por imagen, promediada en el batch.
@@ -383,7 +405,15 @@ def vae_loss(recon, x, mu, logvar, beta):
     recon_per_img = F.mse_loss(recon, x, reduction="none").sum(dim=[1, 2, 3, 4])
     recon_term = recon_per_img.mean()
 
-    kl_per_img = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+    # 1. Calculamos el KL por cada dimensión individualmente
+    kl_per_dim_img = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+    
+    # 2. Aplicamos Free Bits (umbralización) si está activado
+    if free_bits > 0.0:
+        kl_per_dim_img = torch.clamp(kl_per_dim_img, min=free_bits)
+
+    # 3. Sumamos sobre las dimensiones latentes y promediamos por batch
+    kl_per_img = torch.sum(kl_per_dim_img, dim=1)
     kl_term = kl_per_img.mean()
 
     return recon_term + beta * kl_term, recon_term, kl_term
@@ -403,15 +433,17 @@ def kl_per_dim(mu, logvar):
 # =========================================================================== #
 # 4. Train / validate
 # =========================================================================== #
-def train_epoch(model, loader, opt, beta, device, grad_clip):
+def train_epoch(model, loader, opt, beta, device, grad_clip, data_aug_enabled=False, free_bits=0.0):
     model.train()
     tot = rec = kl = 0.0
     n = 0
     for x, _ in loader:
         x = x.to(device)
+        if data_aug_enabled:
+            x = data_augmentation(x)
         opt.zero_grad()
         recon, mu, logvar = model(x)
-        loss, r, k = vae_loss(recon, x, mu, logvar, beta)
+        loss, r, k = vae_loss(recon, x, mu, logvar, beta, free_bits)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         opt.step()
@@ -421,7 +453,7 @@ def train_epoch(model, loader, opt, beta, device, grad_clip):
 
 
 @torch.no_grad()
-def validate(model, loader, device, config, image_metrics=True):
+def validate(model, loader, device, config, image_metrics=True, free_bits=0.0):
     """Valida con beta_final (objetivo estacionario) y calcula diagnósticos.
 
     image_metrics=False omite SSIM/PSNR (lo caro); el resto (val-loss, mse_px,
@@ -436,7 +468,7 @@ def validate(model, loader, device, config, image_metrics=True):
     for x, _ in loader:
         x = x.to(device)
         recon, mu, logvar = model(x)
-        loss, r, k = vae_loss(recon, x, mu, logvar, beta_f)
+        loss, r, k = vae_loss(recon, x, mu, logvar, beta_f, free_bits)
         bs = x.size(0)
         tot += loss.item() * bs; rec += r.item() * bs; kl += k.item() * bs
         mse_px += F.mse_loss(recon, x, reduction="mean").item() * bs
@@ -686,6 +718,37 @@ git_commit    : {commit}
         if self.use_wandb:
             wandb.finish()
 
+    def save_loss_curves(self):
+        if not self.history:
+            return
+
+        epochs = [row["epoch"] for row in self.history]
+
+        recon_tr = [row["loss/recon_train"] for row in self.history]
+        recon_va = [row["loss/recon_val"] for row in self.history]
+        kl_tr = [row["loss/kl_train"] for row in self.history]
+        kl_va = [row["loss/kl_val"] for row in self.history]
+
+        fig, axes = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+
+        axes[0].plot(epochs, recon_tr, label="train", lw=2)
+        axes[0].plot(epochs, recon_va, label="val", lw=2, ls="--")
+        axes[0].set_ylabel("recon")
+        axes[0].set_yscale("log")
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+
+        axes[1].plot(epochs, kl_tr, label="train", lw=2)
+        axes[1].plot(epochs, kl_va, label="val", lw=2, ls="--")
+        axes[1].set_ylabel("kl")
+        axes[1].set_yscale("log")
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend()
+
+
+        fig.suptitle("SemiSupervVAE losses per epoch")
+        plt.tight_layout()
+        self.save_fig(fig, "loss_curves.png")
 
 # =========================================================================== #
 # 7. Loop principal
@@ -716,7 +779,24 @@ def main(config=CONFIG, epoch_callback=None):
     n_par = sum(p.numel() for p in model.parameters())
     print(f"modelo: {n_par/1e6:.2f}M params | share_level_weights={config['share_level_weights']}")
 
-    opt = torch.optim.Adam(model.parameters(), lr=config["lr"])
+    # Separamos los parámetros del Encoder y del Decoder
+    enc_params = (
+        list(model.enc_branches.parameters()) + 
+        list(model.enc_fuse.parameters()) + 
+        list(model.fc_mu.parameters()) + 
+        list(model.fc_logvar.parameters())
+    )
+    dec_params = (
+        list(model.dec_fuse.parameters()) + 
+        list(model.dec_branches.parameters())
+    )
+
+    # Inicializamos Adam con Parameter Groups
+    opt = torch.optim.Adam([
+        {"params": enc_params, "lr": config["lr_enc"]},
+        {"params": dec_params, "lr": config["lr_dec"]}
+    ])
+    
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode="min", factor=0.5, patience=config["sched_patience"])
 
@@ -727,16 +807,18 @@ def main(config=CONFIG, epoch_callback=None):
 
     best_val = math.inf; best_epoch = -1; bad = 0
     ckpt = logger.ckpt_path
+    fb_val = config.get("free_bits", 0.0)  # free bits opcional (default=0.0)
 
     for epoch in range(1, config["epochs"] + 1):
         beta = beta_schedule(epoch, config)
         tr = train_epoch(model, data["train_loader"], opt, beta, device,
-                         config["grad_clip"])
+                         config["grad_clip"], config["data_augmentation"], fb_val)
         # SSIM/PSNR (caras) solo cada metrics_every; la val-loss se calcula siempre
         heavy = (epoch % config["metrics_every"] == 0)
-        val = validate(model, data["val_loader"], device, config, image_metrics=heavy)
+        val = validate(model, data["val_loader"], device, config, image_metrics=heavy, free_bits=fb_val)
         sched.step(val["total"])
-        lr_now = opt.param_groups[0]["lr"]
+        lr_enc_now = opt.param_groups[0]["lr"]
+        lr_dec_now = opt.param_groups[1]["lr"]
 
         # log escalares (recon y kl SIEMPRE separados)
         logger.log_scalars(epoch, {
@@ -748,8 +830,9 @@ def main(config=CONFIG, epoch_callback=None):
             "val/psnr": val.get("psnr", float("nan")),
             "val/active_dims": val["active_dims"],
             "val/kl_per_dim_mean": val["kl_per_dim_mean"],
-            "beta": beta, "lr": lr_now,
+            "beta": beta, "lr_enc": lr_enc_now, "lr_dec": lr_dec_now,
         })
+        logger.save_loss_curves()  # graba loss_curves.png incremental
         print(f"e{epoch:03d} | beta={beta:.3f} | "
               f"train tot={tr['total']:.1f} rec={tr['recon']:.1f} kl={tr['kl']:.1f} | "
               f"val tot={val['total']:.1f} rec={val['recon']:.1f} kl={val['kl']:.1f} | "
@@ -801,6 +884,7 @@ def main(config=CONFIG, epoch_callback=None):
                }}
     logger.summary_path.write_text(json.dumps(summary, indent=2))
     print("resumen:", json.dumps(summary, indent=2))
+    logger.save_loss_curves()  # graba loss_curves.png final
     logger.finish()
     return model
 
@@ -928,6 +1012,10 @@ if __name__ == "__main__":
     ap.add_argument("--sweep", nargs="?", const=str(_REPO / "scripts" / "parameters_vae.dat"),
                     help="corre N VAEs, uno por fila de parameters_vae.dat "
                          "(sin valor usa scripts/parameters_vae.dat)")
+    ap.add_argument("--data-augmentation", action="store_true")
+    ap.add_argument("--lr-enc", type=float, help="tasa de aprendizaje para el encoder")
+    ap.add_argument("--lr-dec", type=float, help="tasa de aprendizaje para el decoder")
+    ap.add_argument("--free-bits", type=float, help="umbral Free Bits (0.0 desactiva)")
     args = ap.parse_args()
 
     cfg = dict(CONFIG)
@@ -942,7 +1030,10 @@ if __name__ == "__main__":
     if args.run_id is not None: cfg["run_id"] = args.run_id
     if args.wandb:       cfg["use_wandb"] = True
     if args.no_share:    cfg["share_level_weights"] = False
-
+    if args.data_augmentation:  cfg["data_augmentation"] = True
+    if args.lr_enc is not None: cfg["lr_enc"] = args.lr_enc
+    if args.lr_dec is not None: cfg["lr_dec"] = args.lr_dec
+    if args.free_bits is not None: cfg["free_bits"] = args.free_bits
     if args.sweep:                       # barrido: N corridas desde el .dat
         run_sweep(args.sweep, cfg)
     else:                                # corrida única (comportamiento previo)
