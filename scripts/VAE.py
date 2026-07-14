@@ -396,23 +396,42 @@ class MultiResVAE(nn.Module):
 # =========================================================================== #
 # 3. Pérdida
 # =========================================================================== #
-def vae_loss(recon, x, mu, logvar, beta, free_bits=0.0):
-    """Devuelve (total, recon, kl) — recon y kl SEPARADOS.
-
-    recon : MSE SUMADA por imagen, promediada en el batch.
-    kl    : KL[q(z|x) || N(0,I)] en forma cerrada, sumada por imagen y promediada.
+def create_spatial_mask(size=30, sigma=7.0, device='cpu'):
     """
-    recon_per_img = F.mse_loss(recon, x, reduction="none").sum(dim=[1, 2, 3, 4])
+    Crea una máscara Gaussiana 2D centrada.
+    Los píxeles centrales tienen peso 1.0, decayendo suavemente hacia los bordes.
+    """
+    coords = torch.arange(size, dtype=torch.float32, device=device)
+    # Centramos las coordenadas (para 30x30, el centro es 14.5)
+    center = (size - 1) / 2.0
+    
+    y, x = torch.meshgrid(coords, coords, indexing='ij')
+    dist_sq = (x - center)**2 + (y - center)**2
+    
+    mask = torch.exp(-dist_sq / (2 * sigma**2))
+    
+    # Redimensionamos para que haga broadcasting perfecto con (B, Niveles, Bandas, H, W)
+    # mask shape: (1, 1, 1, 30, 30)
+    mask = mask.view(1, 1, 1, size, size)
+    
+    return mask
+
+def vae_loss(recon, x, mu, logvar, beta, free_bits=0.0, spatial_mask=None):
+    # reduction="none" nos da el error cuadrado píxel por píxel
+    mse_per_pixel = F.mse_loss(recon, x, reduction="none")
+    
+    # Aplicamos la máscara espacial si existe
+    if spatial_mask is not None:
+        mse_per_pixel = mse_per_pixel * spatial_mask
+
+    # Ahora sí, sumamos los píxeles (ejes 1, 2, 3, 4)
+    recon_per_img = mse_per_pixel.sum(dim=[1, 2, 3, 4])
     recon_term = recon_per_img.mean()
 
-    # 1. Calculamos el KL por cada dimensión individualmente
+    # ... (El cálculo de KL y free_bits se mantiene exactamente igual que antes)
     kl_per_dim_img = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
-    
-    # 2. Aplicamos Free Bits (umbralización) si está activado
     if free_bits > 0.0:
         kl_per_dim_img = torch.clamp(kl_per_dim_img, min=free_bits)
-
-    # 3. Sumamos sobre las dimensiones latentes y promediamos por batch
     kl_per_img = torch.sum(kl_per_dim_img, dim=1)
     kl_term = kl_per_img.mean()
 
@@ -433,7 +452,7 @@ def kl_per_dim(mu, logvar):
 # =========================================================================== #
 # 4. Train / validate
 # =========================================================================== #
-def train_epoch(model, loader, opt, beta, device, grad_clip, data_aug_enabled=False, free_bits=0.0):
+def train_epoch(model, loader, opt, beta, device, grad_clip, data_aug_enabled=False, free_bits=0.0, mask=None):
     model.train()
     tot = rec = kl = 0.0
     n = 0
@@ -443,7 +462,10 @@ def train_epoch(model, loader, opt, beta, device, grad_clip, data_aug_enabled=Fa
             x = data_augmentation(x)
         opt.zero_grad()
         recon, mu, logvar = model(x)
-        loss, r, k = vae_loss(recon, x, mu, logvar, beta, free_bits)
+        
+        # Pasamos free_bits y la máscara
+        loss, r, k = vae_loss(recon, x, mu, logvar, beta, free_bits, mask)
+        
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         opt.step()
@@ -453,12 +475,7 @@ def train_epoch(model, loader, opt, beta, device, grad_clip, data_aug_enabled=Fa
 
 
 @torch.no_grad()
-def validate(model, loader, device, config, image_metrics=True, free_bits=0.0):
-    """Valida con beta_final (objetivo estacionario) y calcula diagnósticos.
-
-    image_metrics=False omite SSIM/PSNR (lo caro); el resto (val-loss, mse_px,
-    active_dims) se calcula SIEMPRE -> el early stopping no se ve afectado.
-    """
+def validate(model, loader, device, config, image_metrics=True, free_bits=0.0, mask=None):
     model.eval()
     beta_f = config["beta_final"]
     tot = rec = kl = mse_px = 0.0
@@ -468,13 +485,18 @@ def validate(model, loader, device, config, image_metrics=True, free_bits=0.0):
     for x, _ in loader:
         x = x.to(device)
         recon, mu, logvar = model(x)
-        loss, r, k = vae_loss(recon, x, mu, logvar, beta_f, free_bits)
+        
+        # Pérdida oficial con máscara para early stopping
+        loss, r, k = vae_loss(recon, x, mu, logvar, beta_f, free_bits, mask)
         bs = x.size(0)
         tot += loss.item() * bs; rec += r.item() * bs; kl += k.item() * bs
+        
+        # Métrica cruda sin máscara para monitoreo
         mse_px += F.mse_loss(recon, x, reduction="mean").item() * bs
+        
         kld_accum += kl_per_dim(mu, logvar) * bs
         n += bs
-        # SSIM/PSNR sobre (B*5,4,30,30); data_range del propio batch (solo si se piden)
+        
         if HAS_TM and image_metrics:
             xr = x.reshape(-1, N_BANDS, IMG, IMG)
             rr = recon.reshape(-1, N_BANDS, IMG, IMG)
@@ -487,11 +509,12 @@ def validate(model, loader, device, config, image_metrics=True, free_bits=0.0):
 
     kld = (kld_accum / n).cpu().numpy()
     active = int((kld > config["active_kl_thresh"]).sum())
+    
     out = {"total": tot / n, "recon": rec / n, "kl": kl / n,
            "mse_px": mse_px / n, "kl_per_dim_mean": float(kld.mean()),
            "active_dims": active, "kld_vec": kld}
-    if HAS_TM and image_metrics:               # sin métricas de imagen: claves ausentes
-        out["ssim"] = ssim_sum / n             # -> el log usa nan en esas épocas
+    if HAS_TM and image_metrics:
+        out["ssim"] = ssim_sum / n
         out["psnr"] = psnr_sum / n
     return out
 
@@ -771,7 +794,7 @@ def main(config=CONFIG, epoch_callback=None):
           f"wandb: {HAS_WANDB} | torchmetrics: {HAS_TM}")
     if device.type == "cpu":
         print("[aviso] sin GPU (CUDA/MPS) -> corriendo en CPU (lento).")
-
+    loss_mask = create_spatial_mask(size=30, sigma=7.0, device=device)
     data = load_data(config, device)
     print(f"train={data['n_train']}  val={data['n_val']}")
 
@@ -812,10 +835,10 @@ def main(config=CONFIG, epoch_callback=None):
     for epoch in range(1, config["epochs"] + 1):
         beta = beta_schedule(epoch, config)
         tr = train_epoch(model, data["train_loader"], opt, beta, device,
-                         config["grad_clip"], config["data_augmentation"], fb_val)
+                         config["grad_clip"], config["data_augmentation"], fb_val, mask=loss_mask)
         # SSIM/PSNR (caras) solo cada metrics_every; la val-loss se calcula siempre
         heavy = (epoch % config["metrics_every"] == 0)
-        val = validate(model, data["val_loader"], device, config, image_metrics=heavy, free_bits=fb_val)
+        val = validate(model, data["val_loader"], device, config, image_metrics=heavy, free_bits=fb_val, mask=loss_mask)
         sched.step(val["total"])
         lr_enc_now = opt.param_groups[0]["lr"]
         lr_dec_now = opt.param_groups[1]["lr"]
